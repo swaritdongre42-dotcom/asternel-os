@@ -96,6 +96,65 @@ pub extern "C" fn _start() -> ! {
 
     serial_write("\r\n[BOOT] Asternel kernel started.\r\n");
 
+    // Executable-file response
+   serial_write("[KERNEL] Checking executable-address response...\r\n");
+
+match limine::executable_address_info() {
+    Some((physical_base, virtual_base)) => {
+        serial_write("[KERNEL] Executable-address response received.\r\n");
+
+        serial_write("[KERNEL] Physical base: ");
+        serial_write_u64(physical_base);
+        serial_write("\r\n");
+
+        serial_write("[KERNEL] Virtual base: ");
+        serial_write_u64(virtual_base);
+        serial_write("\r\n");
+    }
+
+    None => {
+        serial_write("[KERNEL] Executable-address response unavailable.\r\n");
+    }
+}
+
+serial_write("[KERNEL] Validating kernel image reservation...\n");
+
+match limine::kernel_image_reservation() {
+    Ok((start, end)) => {
+        serial_write("[KERNEL] Kernel image reservation validated.\n");
+        serial_write("[KERNEL] Reservation start: ");
+        serial_write_u64(start);
+        serial_write("\n");
+
+        serial_write("[KERNEL] Reservation end: ");
+        serial_write_u64(end);
+        serial_write("\n");
+    }
+
+    Err(error) => {
+        serial_write("[KERNEL] Kernel image reservation validation FAILED.\n");
+
+        match error {
+            limine::KernelReservationError::MissingExecutableAddress =>
+                serial_write("[KERNEL] Missing executable address.\n"),
+            limine::KernelReservationError::InvalidAlignment =>
+                serial_write("[KERNEL] Invalid address alignment.\n"),
+            limine::KernelReservationError::AddressOverflow =>
+                serial_write("[KERNEL] Address overflow.\n"),
+            limine::KernelReservationError::MissingMemoryMap =>
+                serial_write("[KERNEL] Missing memory map.\n"),
+            limine::KernelReservationError::InvalidMemoryMap =>
+                serial_write("[KERNEL] Invalid memory map.\n"),
+            limine::KernelReservationError::KernelRangeNotFound =>
+                serial_write("[KERNEL] Kernel range not found.\n"),
+            limine::KernelReservationError::KernelRangeNotExecutable =>
+                serial_write("[KERNEL] Kernel range is not executable memory.\n"),
+        }
+    }
+}
+
+    
+
     // HHDM response
     serial_write("[HHDM] Checking Higher Half Direct Map...\r\n");
 
@@ -157,17 +216,16 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-// Memory-map boundary rejection test
-if limine::physical_to_virtual(0xFFFFFFFFFFFFF000).is_none() {
-    serial_write("[HHDM] Out-of-range rejection PASSED.\r\n");
-} else {
-    serial_write("[HHDM] Out-of-range rejection FAILED.\r\n");
+    // Memory-map boundary rejection test
+    if limine::physical_to_virtual(0xFFFFFFFFFFFFF000).is_none() {
+        serial_write("[HHDM] Out-of-range rejection PASSED.\r\n");
+    } else {
+        serial_write("[HHDM] Out-of-range rejection FAILED.\r\n");
 
-    loop {
-        core::hint::spin_loop();
+        loop {
+            core::hint::spin_loop();
+        }
     }
-}
-
 
     // Memory-map validation
     serial_write("[MEM] Starting memory-map validation...\r\n");

@@ -1,3 +1,6 @@
+
+use core::ffi::c_void;
+
 #[repr(C)]
 pub struct LimineMemmapEntry {
     pub base: u64,
@@ -27,6 +30,10 @@ pub const LIMINE_MEMMAP_BAD_MEMORY: u64 = 4;
 pub const LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE: u64 = 5;
 pub const LIMINE_MEMMAP_EXECUTABLE_AND_MODULES: u64 = 6;
 pub const LIMINE_MEMMAP_FRAMEBUFFER: u64 = 7;
+
+pub const PAGE_SIZE: u64 = 4096;
+
+pub const KERNEL_IMAGE_SIZE: u64 = 16 * 1024;
 
 // Limine memory-map request
 #[used]
@@ -71,6 +78,69 @@ pub static mut LIMINE_HHDM_REQUEST: LimineHhdmRequest =
         response: core::ptr::null_mut(),
     };
 
+// Limine executable-file structures
+#[repr(C)]
+pub struct LimineExecutableFileResponse {
+    pub revision: u64,
+    pub executable_file: *mut c_void,
+    pub physical_base: u64,
+    pub virtual_base: u64,
+}
+
+#[repr(C)]
+pub struct LimineExecutableFileRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut LimineExecutableFileResponse,
+}
+
+
+#[repr(C)]
+pub struct LimineExecutableAddressResponse {
+    pub revision: u64,
+    pub physical_base: u64,
+    pub virtual_base: u64,
+}
+
+#[repr(C)]
+pub struct LimineExecutableAddressRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut LimineExecutableAddressResponse,
+}
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static mut LIMINE_EXECUTABLE_ADDRESS_REQUEST:
+    LimineExecutableAddressRequest =
+    LimineExecutableAddressRequest {
+        id: [
+            0xc7b1dd30df4c8b88,
+            0x0a82e883a194f07b,
+            0x71ba76863cc55f63,
+            0xb2644a48c516a487,
+        ],
+        revision: 0,
+        response: core::ptr::null_mut(),
+    };
+
+
+
+// Limine executable-file request
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static mut LIMINE_EXECUTABLE_FILE_REQUEST:
+    LimineExecutableFileRequest =
+    LimineExecutableFileRequest {
+        id: [
+            0xc7b1dd30df4c8b88,
+            0x0a82e883a194f07b,
+            0xad97e90e83f1ed67,
+            0x31eb5d1c5ff23b69,
+        ],
+        revision: 0,
+        response: core::ptr::null_mut(),
+    };
 
 // Request section delimiters
 #[used]
@@ -96,7 +166,6 @@ static LIMINE_REQUESTS_END: [u64; 2] = [
     0xadc0e0531bb10d03,
     0x9572709f31764c62,
 ];
-
 
 pub fn memmap_response_ptr() -> *mut LimineMemmapResponse {
     unsafe {
@@ -151,7 +220,7 @@ pub fn memmap_entry_at(
             return None;
         }
 
-       let entry_ptr = entries.add(index as usize).read_volatile();
+        let entry_ptr = entries.add(index as usize).read_volatile();
 
         if entry_ptr.is_null() {
             return None;
@@ -173,7 +242,6 @@ pub fn memmap_entry_at(
         Some((base, length, entry_type))
     }
 }
-
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum MemmapValidationError {
@@ -241,7 +309,6 @@ pub fn validate_memmap() -> Result<u64, MemmapValidationError> {
 
     Ok(unknown_type_count)
 }
-
 
 pub struct MemmapStats {
     pub usable_bytes: u64,
@@ -317,7 +384,6 @@ pub fn calculate_memmap_stats(
     Ok(stats)
 }
 
-
 pub fn hhdm_response_info() -> Option<(u64, u64)> {
     let response = unsafe {
         core::ptr::addr_of!(LIMINE_HHDM_REQUEST.response)
@@ -343,40 +409,40 @@ pub fn hhdm_response_info() -> Option<(u64, u64)> {
     }
 }
 
+pub fn executable_file_address_info() -> Option<(u64, u64)> {
+    let response = unsafe {
+        core::ptr::addr_of!(
+            LIMINE_EXECUTABLE_FILE_REQUEST.response
+        )
+        .read_volatile()
+    };
+
+    if response.is_null() {
+        return None;
+    }
+
+    unsafe {
+        let physical_base =
+            core::ptr::addr_of!((*response).physical_base)
+                .read_volatile();
+
+        let virtual_base =
+            core::ptr::addr_of!((*response).virtual_base)
+                .read_volatile();
+
+        Some((physical_base, virtual_base))
+    }
+}
 
 pub fn physical_to_virtual(
     physical_address: u64,
 ) -> Option<*mut u8> {
     let (_, hhdm_offset) = hhdm_response_info()?;
 
-    // Require the physical address to belong to a memory-map entry.
-    let (_, entry_count, _) = memmap_response_info()?;
-
-    let mut mapped_range = false;
-    let mut index = 0;
-
-    while index < entry_count {
-        let (base, length, _) = memmap_entry_at(index)?;
-
-        let end = base.checked_add(length)?;
-
-        if physical_address >= base && physical_address < end {
-            mapped_range = true;
-            break;
-        }
-
-        index += 1;
-    }
-
-    if !mapped_range {
-        return None;
-    }
-
-    // Calculate the HHDM virtual address.
     let virtual_address =
         hhdm_offset.checked_add(physical_address)?;
 
-    // Verify x86-64 canonical addressing.
+    // Verify x86-64 canonical address.
     let upper = virtual_address >> 48;
     let sign_bit = (virtual_address >> 47) & 1;
 
@@ -391,4 +457,99 @@ pub fn physical_to_virtual(
     }
 
     Some(virtual_address as *mut u8)
+}
+
+
+
+pub fn executable_address_info() -> Option<(u64, u64)> {
+    let response = unsafe {
+        core::ptr::addr_of!(
+            LIMINE_EXECUTABLE_ADDRESS_REQUEST.response
+        )
+        .read_volatile()
+    };
+
+    if response.is_null() {
+        return None;
+    }
+
+    unsafe {
+        let physical_base =
+            core::ptr::addr_of!((*response).physical_base)
+                .read_volatile();
+
+        let virtual_base =
+            core::ptr::addr_of!((*response).virtual_base)
+                .read_volatile();
+
+        Some((physical_base, virtual_base))
+    }
+}
+
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum KernelReservationError {
+    MissingExecutableAddress,
+    InvalidAlignment,
+    AddressOverflow,
+    MissingMemoryMap,
+    InvalidMemoryMap,
+    KernelRangeNotFound,
+    KernelRangeNotExecutable,
+}
+
+pub fn kernel_image_reservation(
+) -> Result<(u64, u64), KernelReservationError> {
+    let (physical_base, virtual_base) =
+        executable_address_info().ok_or(
+            KernelReservationError::MissingExecutableAddress
+        )?;
+
+    if physical_base == 0
+        || virtual_base == 0
+        || physical_base % PAGE_SIZE != 0
+        || virtual_base % PAGE_SIZE != 0
+    {
+        return Err(KernelReservationError::InvalidAlignment);
+    }
+
+    let physical_end = physical_base
+        .checked_add(KERNEL_IMAGE_SIZE)
+        .ok_or(KernelReservationError::AddressOverflow)?;
+
+    validate_memmap().map_err(
+        |_| KernelReservationError::InvalidMemoryMap
+    )?;
+
+    let (_, entry_count, _) =
+        memmap_response_info().ok_or(
+            KernelReservationError::MissingMemoryMap
+        )?;
+
+    let mut index = 0;
+
+    while index < entry_count {
+        let (base, length, entry_type) =
+            memmap_entry_at(index).ok_or(
+                KernelReservationError::InvalidMemoryMap
+            )?;
+
+        let entry_end = base
+            .checked_add(length)
+            .ok_or(KernelReservationError::AddressOverflow)?;
+
+        if physical_base >= base && physical_end <= entry_end {
+            if entry_type != LIMINE_MEMMAP_EXECUTABLE_AND_MODULES {
+                return Err(
+                    KernelReservationError::KernelRangeNotExecutable
+                );
+            }
+
+            return Ok((physical_base, physical_end));
+        }
+
+        index += 1;
+    }
+
+    Err(KernelReservationError::KernelRangeNotFound)
 }

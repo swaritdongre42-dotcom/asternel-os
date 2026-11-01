@@ -1,0 +1,20 @@
+# Rust build output
+target/
+**/target/
+
+# Temporary logs
+*.log
+
+# Generated boot-test files
+boot-test/boot/kernel
+boot-test/EFI/BOOT/BOOTX64.EFI
+
+# Downloaded Limine binaries and archives
+tools/limine/limine-binary/
+tools/limine/limine-binary.tar.gz
+tools/limine/*.fd
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/

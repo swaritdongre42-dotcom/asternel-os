@@ -144,3 +144,147 @@ pub fn memmap_entry_at(
         Some((base, length, entry_type))
     }
 }
+
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum MemmapValidationError {
+    MissingResponse,
+    TooManyEntries,
+    InvalidEntry(u64),
+    UnsortedOrOverlapping(u64),
+}
+
+pub fn validate_memmap() -> Result<u64, MemmapValidationError> {
+    let (_, entry_count, _) =
+        memmap_response_info().ok_or(
+            MemmapValidationError::MissingResponse
+        )?;
+
+    if entry_count > 4096 {
+        return Err(MemmapValidationError::TooManyEntries);
+    }
+
+    let mut previous_end: Option<u64> = None;
+    let mut unknown_type_count = 0;
+
+    let mut index = 0;
+
+    while index < entry_count {
+        let (base, length, entry_type) =
+            memmap_entry_at(index).ok_or(
+                MemmapValidationError::InvalidEntry(index)
+            )?;
+
+        let end = base.checked_add(length).ok_or(
+            MemmapValidationError::InvalidEntry(index)
+        )?;
+
+        if length == 0 {
+            return Err(MemmapValidationError::InvalidEntry(index));
+        }
+
+        if let Some(previous) = previous_end {
+            if base < previous {
+                return Err(
+                    MemmapValidationError::UnsortedOrOverlapping(index)
+                );
+            }
+        }
+
+        match entry_type {
+            LIMINE_MEMMAP_USABLE
+            | LIMINE_MEMMAP_RESERVED
+            | LIMINE_MEMMAP_ACPI_RECLAIMABLE
+            | LIMINE_MEMMAP_ACPI_NVS
+            | LIMINE_MEMMAP_BAD_MEMORY
+            | LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE
+            | LIMINE_MEMMAP_EXECUTABLE_AND_MODULES
+            | LIMINE_MEMMAP_FRAMEBUFFER => {}
+
+            _ => {
+                unknown_type_count += 1;
+            }
+        }
+
+        previous_end = Some(end);
+        index += 1;
+    }
+
+    Ok(unknown_type_count)
+}
+
+
+pub struct MemmapStats {
+    pub usable_bytes: u64,
+    pub usable_region_count: u64,
+    pub largest_usable_region: u64,
+    pub bootloader_reclaimable_bytes: u64,
+    pub bootloader_reclaimable_region_count: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum MemmapStatsError {
+    InvalidMemoryMap,
+    InvalidEntry(u64),
+    ArithmeticOverflow,
+}
+
+pub fn calculate_memmap_stats(
+) -> Result<MemmapStats, MemmapStatsError> {
+    // Never calculate statistics from an invalid memory map.
+    validate_memmap().map_err(
+        |_| MemmapStatsError::InvalidMemoryMap
+    )?;
+
+    let (_, entry_count, _) =
+        memmap_response_info().ok_or(
+            MemmapStatsError::InvalidMemoryMap
+        )?;
+
+    let mut stats = MemmapStats {
+        usable_bytes: 0,
+        usable_region_count: 0,
+        largest_usable_region: 0,
+        bootloader_reclaimable_bytes: 0,
+        bootloader_reclaimable_region_count: 0,
+    };
+
+    let mut index = 0;
+
+    while index < entry_count {
+        let (_, length, entry_type) =
+            memmap_entry_at(index).ok_or(
+                MemmapStatsError::InvalidEntry(index)
+            )?;
+
+        match entry_type {
+            LIMINE_MEMMAP_USABLE => {
+                stats.usable_bytes = stats.usable_bytes
+                    .checked_add(length)
+                    .ok_or(MemmapStatsError::ArithmeticOverflow)?;
+
+                stats.usable_region_count += 1;
+
+                if length > stats.largest_usable_region {
+                    stats.largest_usable_region = length;
+                }
+            }
+
+            LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE => {
+                stats.bootloader_reclaimable_bytes =
+                    stats.bootloader_reclaimable_bytes
+                    .checked_add(length)
+                    .ok_or(MemmapStatsError::ArithmeticOverflow)?;
+
+                stats.bootloader_reclaimable_region_count += 1;
+            }
+
+            _ => {}
+        }
+
+        index += 1;
+    }
+
+    Ok(stats)
+}
+

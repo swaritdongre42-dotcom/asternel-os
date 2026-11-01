@@ -96,6 +96,70 @@ pub extern "C" fn _start() -> ! {
 
     serial_write("\r\n[BOOT] Asternel kernel started.\r\n");
 
+        serial_write("[MEM] Starting memory-map validation...\r\n");
+
+    match limine::validate_memmap() {
+        Ok(unknown_count) => {
+            serial_write("[MEM] Validation PASSED.\r\n");
+
+            serial_write("[MEM] Unknown entry types: ");
+            serial_write_u64(unknown_count);
+            serial_write("\r\n");
+        }
+
+        Err(error) => {
+            serial_write("[MEM] Validation FAILED. Error code: ");
+
+            let code = match error {
+                limine::MemmapValidationError::MissingResponse => 1,
+                limine::MemmapValidationError::TooManyEntries => 2,
+                limine::MemmapValidationError::InvalidEntry(_) => 3,
+                limine::MemmapValidationError::UnsortedOrOverlapping(_) => 4,
+            };
+
+            serial_write_u64(code);
+            serial_write("\r\n");
+
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    match limine::calculate_memmap_stats() {
+    Ok(stats) => {
+        serial_write("[MEM] Physical memory statistics:\r\n");
+
+        serial_write("[MEM] Total usable bytes: ");
+        serial_write_u64(stats.usable_bytes);
+        serial_write("\r\n");
+
+        serial_write("[MEM] Usable regions: ");
+        serial_write_u64(stats.usable_region_count);
+        serial_write("\r\n");
+
+        serial_write("[MEM] Largest usable region: ");
+        serial_write_u64(stats.largest_usable_region);
+        serial_write("\r\n");
+
+        serial_write("[MEM] Bootloader-reclaimable bytes: ");
+        serial_write_u64(stats.bootloader_reclaimable_bytes);
+        serial_write("\r\n");
+
+        serial_write("[MEM] Bootloader-reclaimable regions: ");
+        serial_write_u64(stats.bootloader_reclaimable_region_count);
+        serial_write("\r\n");
+    }
+
+    Err(_) => {
+        serial_write("[MEM] Statistics calculation FAILED.\r\n");
+
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+}
+
     // Read Limine memory map response
     match limine::memmap_response_info() {
         Some((revision, entry_count, _entries)) => {

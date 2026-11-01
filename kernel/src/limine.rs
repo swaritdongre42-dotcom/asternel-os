@@ -43,6 +43,35 @@ pub static mut LIMINE_MEMMAP_REQUEST: LimineMemmapRequest =
         response: core::ptr::null_mut(),
     };
 
+#[repr(C)]
+pub struct LimineHhdmResponse {
+    pub revision: u64,
+    pub offset: u64,
+}
+
+#[repr(C)]
+pub struct LimineHhdmRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut LimineHhdmResponse,
+}
+
+// Limine HHDM request
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static mut LIMINE_HHDM_REQUEST: LimineHhdmRequest =
+    LimineHhdmRequest {
+        id: [
+            0xc7b1dd30df4c8b88,
+            0x0a82e883a194f07b,
+            0x48dcf1cb8ad2b852,
+            0x63984e959a98244b,
+        ],
+        revision: 0,
+        response: core::ptr::null_mut(),
+    };
+
+
 // Request section delimiters
 #[used]
 #[unsafe(link_section = ".limine_requests_start")]
@@ -288,3 +317,78 @@ pub fn calculate_memmap_stats(
     Ok(stats)
 }
 
+
+pub fn hhdm_response_info() -> Option<(u64, u64)> {
+    let response = unsafe {
+        core::ptr::addr_of!(LIMINE_HHDM_REQUEST.response)
+            .read_volatile()
+    };
+
+    if response.is_null() {
+        return None;
+    }
+
+    unsafe {
+        let revision =
+            core::ptr::addr_of!((*response).revision).read_volatile();
+
+        let offset =
+            core::ptr::addr_of!((*response).offset).read_volatile();
+
+        if offset == 0 || offset % 4096 != 0 {
+            return None;
+        }
+
+        Some((revision, offset))
+    }
+}
+
+
+pub fn physical_to_virtual(
+    physical_address: u64,
+) -> Option<*mut u8> {
+    let (_, hhdm_offset) = hhdm_response_info()?;
+
+    // Require the physical address to belong to a memory-map entry.
+    let (_, entry_count, _) = memmap_response_info()?;
+
+    let mut mapped_range = false;
+    let mut index = 0;
+
+    while index < entry_count {
+        let (base, length, _) = memmap_entry_at(index)?;
+
+        let end = base.checked_add(length)?;
+
+        if physical_address >= base && physical_address < end {
+            mapped_range = true;
+            break;
+        }
+
+        index += 1;
+    }
+
+    if !mapped_range {
+        return None;
+    }
+
+    // Calculate the HHDM virtual address.
+    let virtual_address =
+        hhdm_offset.checked_add(physical_address)?;
+
+    // Verify x86-64 canonical addressing.
+    let upper = virtual_address >> 48;
+    let sign_bit = (virtual_address >> 47) & 1;
+
+    let canonical = if sign_bit == 0 {
+        upper == 0
+    } else {
+        upper == 0xFFFF
+    };
+
+    if !canonical {
+        return None;
+    }
+
+    Some(virtual_address as *mut u8)
+}

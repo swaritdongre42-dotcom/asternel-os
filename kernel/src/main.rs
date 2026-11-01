@@ -96,7 +96,81 @@ pub extern "C" fn _start() -> ! {
 
     serial_write("\r\n[BOOT] Asternel kernel started.\r\n");
 
-        serial_write("[MEM] Starting memory-map validation...\r\n");
+    // HHDM response
+    serial_write("[HHDM] Checking Higher Half Direct Map...\r\n");
+
+    match limine::hhdm_response_info() {
+        Some((revision, offset)) => {
+            serial_write("[HHDM] Response received.\r\n");
+
+            serial_write("[HHDM] Response revision: ");
+            serial_write_u64(revision);
+            serial_write("\r\n");
+
+            serial_write("[HHDM] Physical memory offset: ");
+            serial_write_u64(offset);
+            serial_write("\r\n");
+
+            serial_write("[HHDM] Basic validation PASSED.\r\n");
+        }
+
+        None => {
+            serial_write("[HHDM] Response missing or invalid.\r\n");
+
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    // Physical-to-virtual conversion test
+    serial_write("[HHDM] Testing physical-to-virtual conversion...\r\n");
+
+    match limine::physical_to_virtual(0x0010_0000) {
+        Some(address) => {
+            serial_write("[HHDM] Physical address: 1048576\r\n");
+
+            serial_write("[HHDM] Converted virtual address: ");
+            serial_write_u64(address as u64);
+            serial_write("\r\n");
+
+            serial_write("[HHDM] Conversion PASSED.\r\n");
+        }
+
+        None => {
+            serial_write("[HHDM] Conversion FAILED.\r\n");
+
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    // Overflow rejection test
+    if limine::physical_to_virtual(u64::MAX).is_none() {
+        serial_write("[HHDM] Overflow rejection PASSED.\r\n");
+    } else {
+        serial_write("[HHDM] Overflow rejection FAILED.\r\n");
+
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+// Memory-map boundary rejection test
+if limine::physical_to_virtual(0xFFFFFFFFFFFFF000).is_none() {
+    serial_write("[HHDM] Out-of-range rejection PASSED.\r\n");
+} else {
+    serial_write("[HHDM] Out-of-range rejection FAILED.\r\n");
+
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+
+    // Memory-map validation
+    serial_write("[MEM] Starting memory-map validation...\r\n");
 
     match limine::validate_memmap() {
         Ok(unknown_count) => {
@@ -126,41 +200,42 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
+    // Physical memory statistics
     match limine::calculate_memmap_stats() {
-    Ok(stats) => {
-        serial_write("[MEM] Physical memory statistics:\r\n");
+        Ok(stats) => {
+            serial_write("[MEM] Physical memory statistics:\r\n");
 
-        serial_write("[MEM] Total usable bytes: ");
-        serial_write_u64(stats.usable_bytes);
-        serial_write("\r\n");
+            serial_write("[MEM] Total usable bytes: ");
+            serial_write_u64(stats.usable_bytes);
+            serial_write("\r\n");
 
-        serial_write("[MEM] Usable regions: ");
-        serial_write_u64(stats.usable_region_count);
-        serial_write("\r\n");
+            serial_write("[MEM] Usable regions: ");
+            serial_write_u64(stats.usable_region_count);
+            serial_write("\r\n");
 
-        serial_write("[MEM] Largest usable region: ");
-        serial_write_u64(stats.largest_usable_region);
-        serial_write("\r\n");
+            serial_write("[MEM] Largest usable region: ");
+            serial_write_u64(stats.largest_usable_region);
+            serial_write("\r\n");
 
-        serial_write("[MEM] Bootloader-reclaimable bytes: ");
-        serial_write_u64(stats.bootloader_reclaimable_bytes);
-        serial_write("\r\n");
+            serial_write("[MEM] Bootloader-reclaimable bytes: ");
+            serial_write_u64(stats.bootloader_reclaimable_bytes);
+            serial_write("\r\n");
 
-        serial_write("[MEM] Bootloader-reclaimable regions: ");
-        serial_write_u64(stats.bootloader_reclaimable_region_count);
-        serial_write("\r\n");
-    }
+            serial_write("[MEM] Bootloader-reclaimable regions: ");
+            serial_write_u64(stats.bootloader_reclaimable_region_count);
+            serial_write("\r\n");
+        }
 
-    Err(_) => {
-        serial_write("[MEM] Statistics calculation FAILED.\r\n");
+        Err(_) => {
+            serial_write("[MEM] Statistics calculation FAILED.\r\n");
 
-        loop {
-            core::hint::spin_loop();
+            loop {
+                core::hint::spin_loop();
+            }
         }
     }
-}
 
-    // Read Limine memory map response
+    // Read Limine memory-map response
     match limine::memmap_response_info() {
         Some((revision, entry_count, _entries)) => {
             serial_write("[MEM] Response received.\r\n");
@@ -172,7 +247,7 @@ pub extern "C" fn _start() -> ! {
             serial_write_u64(entry_count);
             serial_write("\r\n");
 
-            // Read individual memory map entries
+            // Read individual memory-map entries
             let mut index = 0;
 
             while index < entry_count {
@@ -210,6 +285,7 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
+    // Kernel banner
     serial_write("\r\n");
     serial_write("================================\r\n");
     serial_write("      ASTERNEL KERNEL v0.1\r\n");

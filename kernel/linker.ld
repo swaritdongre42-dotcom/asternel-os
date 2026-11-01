@@ -1,3 +1,4 @@
+
 OUTPUT_FORMAT(elf64-x86-64)
 OUTPUT_ARCH(i386:x86-64)
 ENTRY(_start)
@@ -13,6 +14,8 @@ PHDRS
 SECTIONS
 {
     . = 0xffffffff80000000;
+
+    __kernel_start = .;
 
     .limine_requests : ALIGN(8)
     {
@@ -48,6 +51,9 @@ SECTIONS
         *(COMMON)
         *(.bss .bss.*)
     } :data
+
+    . = ALIGN(4096);
+    __kernel_end = .;
 
     /DISCARD/ :
     {

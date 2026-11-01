@@ -33,7 +33,10 @@ pub const LIMINE_MEMMAP_FRAMEBUFFER: u64 = 7;
 
 pub const PAGE_SIZE: u64 = 4096;
 
-pub const KERNEL_IMAGE_SIZE: u64 = 16 * 1024;
+unsafe extern "C" {
+    static __kernel_start: u8;
+    static __kernel_end: u8;
+}
 
 // Limine memory-map request
 #[used]
@@ -496,6 +499,8 @@ pub enum KernelReservationError {
     InvalidMemoryMap,
     KernelRangeNotFound,
     KernelRangeNotExecutable,
+    InvalidLinkerBounds,
+    VirtualBaseMismatch,
 }
 
 pub fn kernel_image_reservation(
@@ -505,16 +510,43 @@ pub fn kernel_image_reservation(
             KernelReservationError::MissingExecutableAddress
         )?;
 
+   let linker_start =
+    core::ptr::addr_of!(__kernel_start) as u64;
+
+let linker_end =
+    core::ptr::addr_of!(__kernel_end) as u64;
+
+    if linker_start == 0
+        || linker_end <= linker_start
+        || linker_start % PAGE_SIZE != 0
+        || linker_end % PAGE_SIZE != 0
+    {
+        return Err(
+            KernelReservationError::InvalidLinkerBounds
+        );
+    }
+
     if physical_base == 0
-        || virtual_base == 0
         || physical_base % PAGE_SIZE != 0
         || virtual_base % PAGE_SIZE != 0
     {
-        return Err(KernelReservationError::InvalidAlignment);
+        return Err(
+            KernelReservationError::InvalidAlignment
+        );
     }
 
+    if virtual_base != linker_start {
+        return Err(
+            KernelReservationError::VirtualBaseMismatch
+        );
+    }
+
+    let image_size = linker_end
+        .checked_sub(linker_start)
+        .ok_or(KernelReservationError::InvalidLinkerBounds)?;
+
     let physical_end = physical_base
-        .checked_add(KERNEL_IMAGE_SIZE)
+        .checked_add(image_size)
         .ok_or(KernelReservationError::AddressOverflow)?;
 
     validate_memmap().map_err(

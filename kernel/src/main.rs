@@ -89,6 +89,42 @@ fn serial_write_u64(mut value: u64) {
     }
 }
 
+// Detect CPU physical address width
+fn physical_address_width() -> Option<u8> {
+    use core::arch::x86_64::__cpuid;
+
+    let max_leaf = unsafe {
+        __cpuid(0x80000000).eax
+    };
+
+    if max_leaf < 0x80000008 {
+        return None;
+    }
+
+    let result = unsafe {
+        __cpuid(0x80000008)
+    };
+
+    let width = (result.eax & 0xFF) as u8;
+
+    if !(36..=52).contains(&width) {
+        return None;
+    }
+
+    Some(width)
+}
+
+// Build the physical address mask from the detected CPU width.
+fn physical_address_mask(width: u8) -> Option<u64> {
+    if !(36..=52).contains(&width) {
+        return None;
+    }
+
+    Some(((1u64 << width) - 1) & 0x000F_FFFF_FFFF_F000)
+}
+
+
+
 // Kernel entry point
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -149,6 +185,12 @@ match limine::kernel_image_reservation() {
                 serial_write("[KERNEL] Kernel range not found.\n"),
             limine::KernelReservationError::KernelRangeNotExecutable =>
                 serial_write("[KERNEL] Kernel range is not executable memory.\n"),
+
+            limine::KernelReservationError::InvalidLinkerBounds =>
+    serial_write("[KERNEL] Invalid linker image bounds.\n"),
+
+limine::KernelReservationError::VirtualBaseMismatch =>
+    serial_write("[KERNEL] Linker and executable virtual bases differ.\n"),
         }
     }
 }
@@ -258,6 +300,276 @@ match limine::kernel_image_reservation() {
         }
     }
 
+    // Read-only paging mode discovery
+    serial_write("[MM] Checking active paging mode...\r\n");
+
+    let cr4: u64;
+
+    unsafe {
+        asm!(
+            "mov {}, cr4",
+            out(reg) cr4,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+
+    serial_write("[MM] CR4 value: ");
+    serial_write_u64(cr4);
+    serial_write("\r\n");
+
+    if (cr4 & (1 << 12)) == 0 {
+        serial_write("[MM] Five-level paging (LA57): DISABLED\r\n");
+        serial_write("[MM] Active paging mode: FOUR-LEVEL\r\n");
+    } else {
+        serial_write("[MM] Five-level paging (LA57): ENABLED\r\n");
+        serial_write("[MM] Active paging mode: FIVE-LEVEL\r\n");
+    }
+
+
+    // CPU physical address width discovery
+    serial_write("[MM] Checking CPU physical address width...\r\n");
+
+    match physical_address_width() {
+        Some(width) => {
+            serial_write("[MM] Physical address width: ");
+            serial_write_u64(width as u64);
+            serial_write(" bits\r\n");
+        }
+
+        None => {
+            serial_write(
+                "[MM] Physical address width unavailable or invalid.\r\n"
+            );
+        }
+    }
+
+    
+    
+    // Read-only active page-table root discovery
+    serial_write("[MM] Reading active CR3 register...\r\n");
+
+    let cr3: u64;
+
+    unsafe {
+        asm!(
+            "mov {}, cr3",
+            out(reg) cr3,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+
+    let root_page = cr3 & !(limine::PAGE_SIZE - 1);
+
+    serial_write("[MM] CR3 value: ");
+    serial_write_u64(cr3);
+    serial_write("\r\n");
+
+    serial_write("[MM] Page-table root physical address: ");
+    serial_write_u64(root_page);
+    serial_write("\r\n");
+
+    match root_page.checked_add(limine::PAGE_SIZE) {
+        Some(root_end) => {
+            let mut found = false;
+            let mut index = 0;
+
+            if let Some((_, entry_count, _)) =
+                limine::memmap_response_info()
+            {
+                while index < entry_count {
+                    if let Some((base, length, entry_type)) =
+                        limine::memmap_entry_at(index)
+                    {
+                        if let Some(entry_end) = base.checked_add(length) {
+                            if root_page >= base && root_end <= entry_end {
+                                serial_write(
+                                    "[MM] Page-table root memory type: "
+                                );
+                                serial_write_u64(entry_type);
+                                serial_write("\r\n");
+
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    index += 1;
+                }
+            }
+
+            if found {
+                serial_write(
+                    "[MM] Page-table root classification completed.\r\n"
+                );
+            } else {
+                serial_write(
+                    "[MM] Page-table root is not covered by a memory-map entry.\r\n"
+                );
+            }
+        }
+
+        None => {
+            serial_write("[MM] Page-table root range overflow.\r\n");
+        }
+    }
+
+
+    // Read-only PML4 inspection
+    serial_write("[MM] Inspecting PML4 root entries...\r\n");
+
+   
+    match limine::physical_to_virtual(root_page) {
+        Some(root_virtual) => {
+            let pml4 = root_virtual as *const u64;
+            let mut present_count = 0u64;
+            let mut index = 0usize;
+
+            while index < 512 {
+                let entry = unsafe {
+                    core::ptr::read_volatile(pml4.add(index))
+                };
+
+                if (entry & 1) != 0 {
+                    present_count += 1;
+                }
+
+                index += 1;
+            }
+
+            serial_write("[MM] PML4 entries inspected: 512\r\n");
+            serial_write("[MM] Present PML4 entries: ");
+            serial_write_u64(present_count);
+            serial_write("\r\n");
+            serial_write("[MM] PML4 root inspection completed.\r\n");
+
+            // Inspect present entries without dereferencing child tables.
+            serial_write("[MM] Inspecting present PML4 entries...\r\n");
+
+            index = 0;
+
+            while index < 512 {
+                let entry = unsafe {
+                    core::ptr::read_volatile(pml4.add(index))
+                };
+
+                if (entry & 1) != 0 {
+                    serial_write("[MM] PML4 index: ");
+                    serial_write_u64(index as u64);
+
+                    serial_write(" | Raw entry: ");
+                    serial_write_u64(entry);
+
+                    serial_write("\r\n[MM] Writable: ");
+                    serial_write_u64((entry >> 1) & 1);
+
+                    serial_write(" | User: ");
+                    serial_write_u64((entry >> 2) & 1);
+
+                    serial_write(" | NX: ");
+                    serial_write_u64((entry >> 63) & 1);
+                    serial_write("\r\n");
+
+                    if (entry & (1 << 7)) != 0 {
+                        serial_write("[MM] ERROR: Reserved PS bit is set.\r\n");
+                    } else {
+                        match physical_address_width()
+                            .and_then(physical_address_mask)
+                        {
+                            Some(address_mask) => {
+                                let address_bits =
+                                    entry & 0x000F_FFFF_FFFF_F000;
+
+                                if (address_bits & !address_mask) != 0 {
+                                    serial_write(
+                                        "[MM] ERROR: Unsupported physical address bits.\r\n"
+                                    );
+                                } else {
+                                    let child_physical = address_bits & address_mask;
+
+                                    if child_physical == 0 {
+                                        serial_write(
+                                            "[MM] ERROR: Child table address is zero.\r\n"
+                                        );
+                                    } else {
+                                        serial_write("[MM] Child table physical address: ");
+                                        serial_write_u64(child_physical);
+                                        serial_write("\r\n");
+
+                                        match child_physical.checked_add(limine::PAGE_SIZE) {
+                                            Some(child_end) => {
+                                                let mut classified = false;
+                                                let mut map_index = 0;
+
+                                                if let Some((_, count, _)) =
+                                                    limine::memmap_response_info()
+                                                {
+                                                    while map_index < count {
+                                                        if let Some((base, length, kind)) =
+                                                            limine::memmap_entry_at(map_index)
+                                                        {
+                                                            if let Some(end) = base.checked_add(length) {
+                                                                if child_physical >= base
+                                                                    && child_end <= end
+                                                                {
+                                                                    serial_write(
+                                                                        "[MM] Child table memory type: "
+                                                                    );
+                                                                    serial_write_u64(kind);
+                                                                    serial_write("\r\n");
+
+                                                                    classified = true;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+
+                                                        map_index += 1;
+                                                    }
+                                                }
+
+                                                if !classified {
+                                                    serial_write(
+                                                        "[MM] Child table range not classified.\r\n"
+                                                    );
+                                                }
+                                            }
+
+                                            None => {
+                                                serial_write(
+                                                    "[MM] Child table range overflow.\r\n"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            None => {
+                                serial_write(
+                                    "[MM] ERROR: Physical address mask unavailable.\r\n"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                index += 1;
+            }
+
+            serial_write(
+                "[MM] Present PML4 entry inspection completed.\r\n"
+            );
+        }
+
+        None => {
+            serial_write("[MM] PML4 HHDM conversion failed.\r\n");
+        }
+    }
+
+
+    
+    
     // Physical memory statistics
     match limine::calculate_memmap_stats() {
         Ok(stats) => {

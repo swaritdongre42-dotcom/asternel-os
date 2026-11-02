@@ -125,6 +125,45 @@ fn physical_address_mask(width: u8) -> Option<u64> {
 
 
 
+fn nx_enabled() -> bool {
+    use core::arch::x86_64::__cpuid;
+
+    let max_leaf = __cpuid(0x80000000).eax;
+
+    if max_leaf < 0x80000001 {
+        return false;
+    }
+
+    let features = __cpuid(0x80000001);
+
+    // Extended feature bit 20: NX support.
+    if (features.edx & (1 << 20)) == 0 {
+        return false;
+    }
+
+    // Read EFER MSR.
+    let low: u32;
+    let high: u32;
+
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") 0xC0000080u32,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+
+    let efer = ((high as u64) << 32) | low as u64;
+
+    // EFER.NXE is bit 11.
+    (efer & (1 << 11)) != 0
+}
+
+
+
+
 // Kernel entry point
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -346,8 +385,47 @@ limine::KernelReservationError::VirtualBaseMismatch =>
     
     
     // Read-only active page-table root discovery
-    serial_write("[MM] Reading active CR3 register...\r\n");
+   
+    // Read-only active page-table root discovery and validation
+    serial_write("[MM] Validating active CR3 register...\r\n");
 
+    // Reject five-level paging because this implementation expects PML4.
+    if (cr4 & (1 << 12)) != 0 {
+        serial_write("[MM] ERROR: Five-level paging is unsupported.\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    // Detect whether PCID is enabled.
+    let pcide_enabled = (cr4 & (1 << 17)) != 0;
+
+    serial_write("[MM] PCIDE: ");
+    serial_write_u64(pcide_enabled as u64);
+    serial_write("\r\n");
+
+    // Obtain the CPU physical-address width.
+    let address_width = match physical_address_width() {
+        Some(width) => width,
+        None => {
+            serial_write("[MM] ERROR: Physical address width unavailable.\r\n");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+    };
+
+    let address_mask = match physical_address_mask(address_width) {
+        Some(mask) => mask,
+        None => {
+            serial_write("[MM] ERROR: Physical address mask unavailable.\r\n");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+    };
+
+    // Read CR3.
     let cr3: u64;
 
     unsafe {
@@ -358,61 +436,89 @@ limine::KernelReservationError::VirtualBaseMismatch =>
         );
     }
 
-    let root_page = cr3 & !(limine::PAGE_SIZE - 1);
-
-    serial_write("[MM] CR3 value: ");
+    serial_write("[MM] CR3 raw value: ");
     serial_write_u64(cr3);
     serial_write("\r\n");
 
-    serial_write("[MM] Page-table root physical address: ");
+    // When PCIDE is disabled, only PWT (bit 3) and PCD (bit 4)
+    // are permitted in the low 12 bits.
+    if !pcide_enabled && (cr3 & 0xFE7) != 0 {
+        serial_write("[MM] ERROR: Reserved CR3 low bits are set.\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    // Extract the physical-address field.
+    let address_field = cr3 & 0x000F_FFFF_FFFF_F000;
+
+    // Reject physical-address bits above MAXPHYADDR and reserved
+    // upper bits outside the physical-address field.
+    if (address_field & !address_mask) != 0
+        || (cr3 & !(address_mask | 0xFFF)) != 0
+    {
+        serial_write("[MM] ERROR: CR3 contains unsupported address bits.\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    let root_page = address_field & address_mask;
+
+    if root_page == 0 || root_page % limine::PAGE_SIZE != 0 {
+        serial_write("[MM] ERROR: Invalid CR3 root address.\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    serial_write("[MM] CR3 physical root: ");
     serial_write_u64(root_page);
     serial_write("\r\n");
 
-    match root_page.checked_add(limine::PAGE_SIZE) {
-        Some(root_end) => {
-            let mut found = false;
-            let mut index = 0;
+    // Verify that the complete root page belongs to one memory-map entry.
+    let root_end = match root_page.checked_add(limine::PAGE_SIZE) {
+        Some(end) => end,
+        None => {
+            serial_write("[MM] ERROR: CR3 root range overflow.\r\n");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+    };
 
-            if let Some((_, entry_count, _)) =
-                limine::memmap_response_info()
+    let mut root_classified = false;
+    let mut map_index = 0;
+
+    if let Some((_, entry_count, _)) = limine::memmap_response_info() {
+        while map_index < entry_count {
+            if let Some((base, length, entry_type)) =
+                limine::memmap_entry_at(map_index)
             {
-                while index < entry_count {
-                    if let Some((base, length, entry_type)) =
-                        limine::memmap_entry_at(index)
-                    {
-                        if let Some(entry_end) = base.checked_add(length) {
-                            if root_page >= base && root_end <= entry_end {
-                                serial_write(
-                                    "[MM] Page-table root memory type: "
-                                );
-                                serial_write_u64(entry_type);
-                                serial_write("\r\n");
+                if let Some(entry_end) = base.checked_add(length) {
+                    if root_page >= base && root_end <= entry_end {
+                        serial_write("[MM] Root memory type: ");
+                        serial_write_u64(entry_type);
+                        serial_write("\r\n");
 
-                                found = true;
-                                break;
-                            }
-                        }
+                        root_classified = true;
+                        break;
                     }
-
-                    index += 1;
                 }
             }
 
-            if found {
-                serial_write(
-                    "[MM] Page-table root classification completed.\r\n"
-                );
-            } else {
-                serial_write(
-                    "[MM] Page-table root is not covered by a memory-map entry.\r\n"
-                );
-            }
-        }
-
-        None => {
-            serial_write("[MM] Page-table root range overflow.\r\n");
+            map_index += 1;
         }
     }
+
+    if !root_classified {
+        serial_write("[MM] ERROR: CR3 root is not classified.\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    serial_write("[MM] CR3 validation PASSED.\r\n");
 
 
     // Read-only PML4 inspection
@@ -444,7 +550,24 @@ limine::KernelReservationError::VirtualBaseMismatch =>
             serial_write("[MM] PML4 root inspection completed.\r\n");
 
             // Inspect present entries without dereferencing child tables.
-            serial_write("[MM] Inspecting present PML4 entries...\r\n");
+           
+            // Validate present PML4 entries without dereferencing children.
+            serial_write("[MM] Validating present PML4 entries...\r\n");
+
+            let address_mask = match physical_address_width()
+                .and_then(physical_address_mask)
+            {
+                Some(mask) => mask,
+                None => {
+                    serial_write("[MM] ERROR: Physical address mask unavailable.\r\n");
+                    loop {
+                        core::hint::spin_loop();
+                    }
+                }
+            };
+
+            let nx_active = nx_enabled();
+            let mut validation_failed = false;
 
             index = 0;
 
@@ -456,106 +579,100 @@ limine::KernelReservationError::VirtualBaseMismatch =>
                 if (entry & 1) != 0 {
                     serial_write("[MM] PML4 index: ");
                     serial_write_u64(index as u64);
-
                     serial_write(" | Raw entry: ");
                     serial_write_u64(entry);
-
-                    serial_write("\r\n[MM] Writable: ");
-                    serial_write_u64((entry >> 1) & 1);
-
-                    serial_write(" | User: ");
-                    serial_write_u64((entry >> 2) & 1);
-
-                    serial_write(" | NX: ");
-                    serial_write_u64((entry >> 63) & 1);
                     serial_write("\r\n");
 
+                    // PS is reserved in a PML4 entry.
                     if (entry & (1 << 7)) != 0 {
                         serial_write("[MM] ERROR: Reserved PS bit is set.\r\n");
-                    } else {
-                        match physical_address_width()
-                            .and_then(physical_address_mask)
+                        validation_failed = true;
+                    }
+
+                    // NX is reserved when EFER.NXE is disabled.
+                    if (entry & (1u64 << 63)) != 0 && !nx_active {
+                        serial_write("[MM] ERROR: NX set while NXE is disabled.\r\n");
+                        validation_failed = true;
+                    }
+
+                    let address_bits =
+                        entry & 0x000F_FFFF_FFFF_F000;
+
+                    if (address_bits & !address_mask) != 0 {
+                        serial_write("[MM] ERROR: Physical address exceeds CPU width.\r\n");
+                        validation_failed = true;
+                    } else if (entry & (1 << 7)) == 0 {
+                        let child_physical =
+                            address_bits & address_mask;
+
+                        let child_end = match child_physical
+                            .checked_add(limine::PAGE_SIZE)
                         {
-                            Some(address_mask) => {
-                                let address_bits =
-                                    entry & 0x000F_FFFF_FFFF_F000;
+                            Some(end) => end,
+                            None => {
+                                serial_write("[MM] ERROR: Child range overflow.\r\n");
+                                validation_failed = true;
+                                index += 1;
+                                continue;
+                            }
+                        };
 
-                                if (address_bits & !address_mask) != 0 {
-                                    serial_write(
-                                        "[MM] ERROR: Unsupported physical address bits.\r\n"
-                                    );
-                                } else {
-                                    let child_physical = address_bits & address_mask;
+                        let mut classified = false;
+                        let mut map_index = 0;
 
-                                    if child_physical == 0 {
-                                        serial_write(
-                                            "[MM] ERROR: Child table address is zero.\r\n"
-                                        );
-                                    } else {
-                                        serial_write("[MM] Child table physical address: ");
-                                        serial_write_u64(child_physical);
-                                        serial_write("\r\n");
+                        if let Some((_, count, _)) =
+                            limine::memmap_response_info()
+                        {
+                            while map_index < count {
+                                if let Some((base, length, kind)) =
+                                    limine::memmap_entry_at(map_index)
+                                {
+                                    if let Some(end) = base.checked_add(length) {
+                                        if child_physical >= base
+                                            && child_end <= end
+                                        {
+                                            serial_write("[MM] Child table physical address: ");
+                                            serial_write_u64(child_physical);
+                                            serial_write("\r\n[MM] Child table memory type: ");
+                                            serial_write_u64(kind);
+                                            serial_write("\r\n");
 
-                                        match child_physical.checked_add(limine::PAGE_SIZE) {
-                                            Some(child_end) => {
-                                                let mut classified = false;
-                                                let mut map_index = 0;
-
-                                                if let Some((_, count, _)) =
-                                                    limine::memmap_response_info()
-                                                {
-                                                    while map_index < count {
-                                                        if let Some((base, length, kind)) =
-                                                            limine::memmap_entry_at(map_index)
-                                                        {
-                                                            if let Some(end) = base.checked_add(length) {
-                                                                if child_physical >= base
-                                                                    && child_end <= end
-                                                                {
-                                                                    serial_write(
-                                                                        "[MM] Child table memory type: "
-                                                                    );
-                                                                    serial_write_u64(kind);
-                                                                    serial_write("\r\n");
-
-                                                                    classified = true;
-                                                                    break;
-                                                                }
-                                                            }
-                                                        }
-
-                                                        map_index += 1;
-                                                    }
-                                                }
-
-                                                if !classified {
-                                                    serial_write(
-                                                        "[MM] Child table range not classified.\r\n"
-                                                    );
-                                                }
-                                            }
-
-                                            None => {
-                                                serial_write(
-                                                    "[MM] Child table range overflow.\r\n"
-                                                );
-                                            }
+                                            classified = true;
+                                            break;
                                         }
                                     }
                                 }
-                            }
 
-                            None => {
-                                serial_write(
-                                    "[MM] ERROR: Physical address mask unavailable.\r\n"
-                                );
+                                map_index += 1;
                             }
                         }
+
+                        if !classified {
+                            serial_write("[MM] ERROR: Child table is not classified.\r\n");
+                            validation_failed = true;
+                        }
                     }
+
+                    serial_write("[MM] Writable: ");
+                    serial_write_u64((entry >> 1) & 1);
+                    serial_write(" | User: ");
+                    serial_write_u64((entry >> 2) & 1);
+                    serial_write(" | NX: ");
+                    serial_write_u64((entry >> 63) & 1);
+                    serial_write("\r\n");
                 }
 
                 index += 1;
             }
+
+            if validation_failed {
+                serial_write("[MM] PML4 validation FAILED.\r\n");
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
+
+            serial_write("[MM] PML4 validation PASSED.\r\n");
 
             serial_write(
                 "[MM] Present PML4 entry inspection completed.\r\n"

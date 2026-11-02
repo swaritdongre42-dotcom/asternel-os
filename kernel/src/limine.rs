@@ -649,3 +649,64 @@ pub fn is_hhdm_mapped_memory_type(entry_type: u64) -> bool {
             | LIMINE_MEMMAP_FRAMEBUFFER
     )
 }
+
+
+
+pub fn physical_range_is_classified(
+    physical_address: u64,
+    length: u64,
+) -> bool {
+    if length == 0 {
+        return false;
+    }
+
+    let range_end = match physical_address.checked_add(length) {
+        Some(end) => end,
+        None => return false,
+    };
+
+    let (_, entry_count, _) = match memmap_response_info() {
+        Some(info) => info,
+        None => return false,
+    };
+
+    let mut cursor = physical_address;
+
+    while cursor < range_end {
+        let mut furthest_end = cursor;
+        let mut index = 0u64;
+
+        while index < entry_count {
+            let (base, entry_length, _) =
+                match memmap_entry_at(index) {
+                    Some(entry) => entry,
+                    None => return false,
+                };
+
+            let entry_end = match base.checked_add(entry_length) {
+                Some(end) => end,
+                None => return false,
+            };
+
+            if entry_length != 0
+                && base <= cursor
+                && entry_end > furthest_end
+            {
+                furthest_end = core::cmp::min(
+                    entry_end,
+                    range_end,
+                );
+            }
+
+            index += 1;
+        }
+
+        if furthest_end == cursor {
+            return false;
+        }
+
+        cursor = furthest_end;
+    }
+
+    true
+}

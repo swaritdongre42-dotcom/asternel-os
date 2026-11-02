@@ -123,7 +123,35 @@ fn physical_address_mask(width: u8) -> Option<u64> {
     Some(((1u64 << width) - 1) & 0x000F_FFFF_FFFF_F000)
 }
 
+// Validate a complete physical range represented by a page-table leaf.
+fn validate_leaf_physical_range(
+    physical_base: u64,
+    mapping_size: u64,
+    address_width: u8,
+) -> bool {
+    if mapping_size == 0 || physical_base % mapping_size != 0 {
+        return false;
+    }
 
+    let range_end = match physical_base.checked_add(mapping_size) {
+        Some(end) => end,
+        None => return false,
+    };
+
+    let physical_limit = match 1u64.checked_shl(address_width as u32) {
+        Some(limit) => limit,
+        None => return false,
+    };
+
+    if range_end > physical_limit {
+        return false;
+    }
+
+    limine::physical_range_is_classified(
+        physical_base,
+        mapping_size,
+    )
+}
 
 fn nx_enabled() -> bool {
     use core::arch::x86_64::__cpuid;
@@ -234,7 +262,7 @@ limine::KernelReservationError::VirtualBaseMismatch =>
     }
 }
 
-    
+
 
     // HHDM response
     serial_write("[HHDM] Checking Higher Half Direct Map...\r\n");
@@ -382,10 +410,10 @@ limine::KernelReservationError::VirtualBaseMismatch =>
         }
     }
 
-    
-    
+
+
     // Read-only active page-table root discovery
-   
+
     // Read-only active page-table root discovery and validation
     serial_write("[MM] Validating active CR3 register...\r\n");
 
@@ -524,7 +552,7 @@ limine::KernelReservationError::VirtualBaseMismatch =>
     // Read-only PML4 inspection
     serial_write("[MM] Inspecting PML4 root entries...\r\n");
 
-   
+
     match limine::physical_to_virtual(root_page) {
         Some(_) => {
            let pml4_virtual = match limine::physical_range_to_virtual(
@@ -543,7 +571,7 @@ limine::KernelReservationError::VirtualBaseMismatch =>
 let pml4 = pml4_virtual as *const u64;
 serial_write("[MM] PML4 HHDM range validation PASSED.\r\n");
 
-            
+
             let mut present_count = 0u64;
             let mut index = 0usize;
 
@@ -566,7 +594,7 @@ serial_write("[MM] PML4 HHDM range validation PASSED.\r\n");
             serial_write("[MM] PML4 root inspection completed.\r\n");
 
             // Inspect present entries without dereferencing child tables.
-           
+
             // Validate present PML4 entries without dereferencing children.
             serial_write("[MM] Validating present PML4 entries...\r\n");
 
@@ -694,11 +722,15 @@ serial_write("[MM] PML4 HHDM range validation PASSED.\r\n");
 
 let mut pdpt_count = 0u64;
 let mut pml4_index = 0usize;
-            
-            let mut leaf_entries = 0u64;
+
+ let mut leaf_entries = 0u64;
 let mut writable_entries = 0u64;
 let mut user_entries = 0u64;
 let mut nx_entries = 0u64;
+
+let mut validated_1g = 0u64;
+let mut validated_2m = 0u64;
+let mut validated_4k = 0u64;
 
 while pml4_index < 512 {
     let pml4_entry =
@@ -709,7 +741,7 @@ while pml4_index < 512 {
 let pml4_writable = (pml4_entry & (1 << 1)) != 0;
 let pml4_user = (pml4_entry & (1 << 2)) != 0;
 let pml4_nx = (pml4_entry & (1u64 << 63)) != 0;
-        
+
         let child_physical =
             pml4_entry & 0x000F_FFFF_FFFF_F000;
 
@@ -831,11 +863,26 @@ if effective_nx {
     nx_entries += 1;
 }
 
-            
+
             let physical_base =
                 address_bits & !((1u64 << 30) - 1);
 
-            
+            if !validate_leaf_physical_range(
+    physical_base,
+    1u64 << 30,
+    address_width,
+) {
+    serial_write(
+        "[MM] ERROR: 1 GiB physical mapping validation failed.\r\n"
+    );
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+validated_1g += 1;
+
+
 
             serial_write("[MM] Mapping type: 1 GiB HUGE PAGE\r\n");
             serial_write("[MM] Physical base: ");
@@ -948,6 +995,25 @@ let pde_nx =
                                     }
                                 }
 
+let physical_base =
+    address_bits & !((1u64 << 21) - 1);
+
+if !validate_leaf_physical_range(
+    physical_base,
+    1u64 << 21,
+    address_width,
+) {
+    serial_write(
+        "[MM] ERROR: 2 MiB physical mapping validation failed.\r\n"
+    );
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+validated_2m += 1;
+
+
                                huge_pages += 1;
 
 leaf_entries += 1;
@@ -963,7 +1029,7 @@ if pde_user {
 if pde_nx {
     nx_entries += 1;
 }
-                                
+
                             } else {
                                 // Pointer to a page table.
                                 let table_physical =
@@ -1028,7 +1094,7 @@ if pte_user {
 if pte_nx {
     nx_entries += 1;
 }
-                
+
 
                 let nx = (entry >> 63) & 1;
 
@@ -1054,6 +1120,26 @@ if pte_nx {
                         core::hint::spin_loop();
                     }
                 }
+
+
+let physical_base = address_bits & address_mask;
+
+if !validate_leaf_physical_range(
+    physical_base,
+    limine::PAGE_SIZE,
+    address_width,
+) {
+    serial_write(
+        "[MM] ERROR: 4 KiB physical mapping validation failed.\r\n"
+    );
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+validated_4k += 1;
+
+
             }
 
             table_index += 1;
@@ -1170,8 +1256,25 @@ if writable_entries > leaf_entries
     }
 }
 
+serial_write("[MM] Physical mapping validation summary:\r\n");
+
+serial_write("[MM] Validated 1 GiB mappings: ");
+serial_write_u64(validated_1g);
+serial_write("\r\n");
+
+serial_write("[MM] Validated 2 MiB mappings: ");
+serial_write_u64(validated_2m);
+serial_write("\r\n");
+
+serial_write("[MM] Validated 4 KiB mappings: ");
+serial_write_u64(validated_4k);
+serial_write("\r\n");
+
+serial_write("[MM] Physical mapping validation PASSED.\r\n");
+
+
 serial_write("[MM] Effective permission analysis PASSED.\r\n");
-            
+
 
             serial_write(
                 "[MM] Present PML4 entry inspection completed.\r\n"
@@ -1184,8 +1287,8 @@ serial_write("[MM] Effective permission analysis PASSED.\r\n");
     }
 
 
-    
-    
+
+
     // Physical memory statistics
     match limine::calculate_memmap_stats() {
         Ok(stats) => {

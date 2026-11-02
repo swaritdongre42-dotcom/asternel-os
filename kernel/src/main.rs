@@ -801,14 +801,7 @@ while pml4_index < 512 {
             let physical_base =
                 address_bits & !((1u64 << 30) - 1);
 
-            if physical_base == 0 {
-                serial_write(
-                    "[MM] ERROR: Invalid huge-page physical base.\r\n"
-                );
-                loop {
-                    core::hint::spin_loop();
-                }
-            }
+            
 
             serial_write("[MM] Mapping type: 1 GiB HUGE PAGE\r\n");
             serial_write("[MM] Physical base: ");
@@ -828,21 +821,211 @@ while pml4_index < 512 {
                 }
             }
 
-            match limine::physical_range_to_virtual(
+             match limine::physical_range_to_virtual(
                 directory_physical,
                 limine::PAGE_SIZE,
             ) {
-                Some(_) => {
+                Some(directory_virtual) => {
                     serial_write(
                         "[MM] Mapping type: PAGE DIRECTORY POINTER\r\n"
                     );
                     serial_write(
                         "[MM] Page-directory HHDM range validation PASSED.\r\n"
                     );
-                    serial_write("[MM] Directory physical address: ");
-                    serial_write_u64(directory_physical);
+
+                    let directory = directory_virtual as *const u64;
+
+                    let mut directory_present = 0u64;
+                    let mut huge_pages = 0u64;
+                    let mut page_table_pointers = 0u64;
+
+                    let address_mask = match physical_address_width()
+                        .and_then(physical_address_mask)
+                    {
+                        Some(mask) => mask,
+                        None => {
+                            serial_write(
+                                "[MM] ERROR: Address mask unavailable.\r\n"
+                            );
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+                    };
+
+                    let mut directory_index = 0usize;
+
+                    while directory_index < 512 {
+                        let entry = unsafe {
+                            core::ptr::read_volatile(
+                                directory.add(directory_index)
+                            )
+                        };
+
+                        if (entry & 1) != 0 {
+                            directory_present += 1;
+
+                            let writable = (entry >> 1) & 1;
+                            let user = (entry >> 2) & 1;
+                            let page_size = (entry >> 7) & 1;
+                            let nx = (entry >> 63) & 1;
+
+                            let address_bits =
+                                entry & 0x000F_FFFF_FFFF_F000;
+
+                            if (address_bits & !address_mask) != 0 {
+                                serial_write(
+                                    "[MM] ERROR: PDE address exceeds physical width.\r\n"
+                                );
+                                loop {
+                                    core::hint::spin_loop();
+                                }
+                            }
+
+                            if nx != 0 && !nx_enabled() {
+                                serial_write(
+                                    "[MM] ERROR: PDE NX bit unsupported.\r\n"
+                                );
+                                loop {
+                                    core::hint::spin_loop();
+                                }
+                            }
+
+                            if page_size != 0 {
+                                // 2 MiB huge-page mapping.
+                                let reserved_bits =
+                                    entry & 0x0000_0000_001F_E000;
+
+                                if reserved_bits != 0 {
+                                    serial_write(
+                                        "[MM] ERROR: Invalid 2 MiB page alignment.\r\n"
+                                    );
+                                    loop {
+                                        core::hint::spin_loop();
+                                    }
+                                }
+
+                               huge_pages += 1;
+                            } else {
+                                // Pointer to a page table.
+                                let table_physical =
+                                    address_bits & address_mask;
+
+                                if table_physical
+                                    & (limine::PAGE_SIZE - 1) != 0
+                                {
+                                    serial_write(
+                                        "[MM] ERROR: Page-table address is unaligned.\r\n"
+                                    );
+                                    loop {
+                                        core::hint::spin_loop();
+                                    }
+                                }
+
+                                match limine::physical_range_to_virtual(
+    table_physical,
+    limine::PAGE_SIZE,
+) {
+    Some(table_virtual) => {
+        page_table_pointers += 1;
+
+        serial_write(
+            "[MM] Page-table HHDM validation PASSED.\r\n"
+        );
+
+        let page_table = table_virtual as *const u64;
+
+        let mut table_present = 0u64;
+        let mut table_index = 0usize;
+
+        while table_index < 512 {
+            let entry = unsafe {
+                core::ptr::read_volatile(
+                    page_table.add(table_index)
+                )
+            };
+
+            if (entry & 1) != 0 {
+                table_present += 1;
+
+                let nx = (entry >> 63) & 1;
+
+                let address_bits =
+                    entry & 0x000F_FFFF_FFFF_F000;
+
+                // Validate physical address width.
+                if (address_bits & !address_mask) != 0 {
+                    serial_write(
+                        "[MM] ERROR: PTE address exceeds physical width.\r\n"
+                    );
+                    loop {
+                        core::hint::spin_loop();
+                    }
+                }
+
+                // Validate NX support.
+                if nx != 0 && !nx_enabled() {
+                    serial_write(
+                        "[MM] ERROR: PTE NX bit unsupported.\r\n"
+                    );
+                    loop {
+                        core::hint::spin_loop();
+                    }
+                }
+            }
+
+            table_index += 1;
+        }
+
+        serial_write(
+            "[MM] Page-table entries inspected: 512\r\n"
+        );
+
+        serial_write(
+            "[MM] Present page-table entries: "
+        );
+        serial_write_u64(table_present);
+        serial_write("\r\n");
+    }
+
+    None => {
+        serial_write(
+            "[MM] ERROR: Page-table HHDM validation failed.\r\n"
+        );
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+}
+                            }
+
+                            let _ = (writable, user);
+                        }
+
+                        directory_index += 1;
+                    }
+
+                    serial_write(
+                        "[MM] Page-directory entries inspected: 512\r\n"
+                    );
+
+                    serial_write(
+                        "[MM] Present directory entries: "
+                    );
+                    serial_write_u64(directory_present);
+                    serial_write("\r\n");
+
+                    serial_write("[MM] 2 MiB huge pages: ");
+                    serial_write_u64(huge_pages);
+                    serial_write("\r\n");
+
+                    serial_write(
+                        "[MM] Page-table pointers validated: "
+                    );
+                    serial_write_u64(page_table_pointers);
                     serial_write("\r\n");
                 }
+
                 None => {
                     serial_write(
                         "[MM] ERROR: Page-directory HHDM validation failed.\r\n"

@@ -694,12 +694,22 @@ serial_write("[MM] PML4 HHDM range validation PASSED.\r\n");
 
 let mut pdpt_count = 0u64;
 let mut pml4_index = 0usize;
+            
+            let mut leaf_entries = 0u64;
+let mut writable_entries = 0u64;
+let mut user_entries = 0u64;
+let mut nx_entries = 0u64;
 
 while pml4_index < 512 {
     let pml4_entry =
         unsafe { core::ptr::read_volatile(pml4.add(pml4_index)) };
 
     if (pml4_entry & 1) != 0 {
+
+let pml4_writable = (pml4_entry & (1 << 1)) != 0;
+let pml4_user = (pml4_entry & (1 << 2)) != 0;
+let pml4_nx = (pml4_entry & (1u64 << 63)) != 0;
+        
         let child_physical =
             pml4_entry & 0x000F_FFFF_FFFF_F000;
 
@@ -731,6 +741,15 @@ while pml4_index < 512 {
 
     if (entry & 1) != 0 {
         present_entries += 1;
+
+        let effective_writable =
+    pml4_writable && (entry & (1 << 1)) != 0;
+
+let effective_user =
+    pml4_user && (entry & (1 << 2)) != 0;
+
+let effective_nx =
+    pml4_nx || (entry & (1u64 << 63)) != 0;
 
         let writable = (entry >> 1) & 1;
         let user = (entry >> 2) & 1;
@@ -798,6 +817,21 @@ while pml4_index < 512 {
                 }
             }
 
+leaf_entries += 1;
+
+if effective_writable {
+    writable_entries += 1;
+}
+
+if effective_user {
+    user_entries += 1;
+}
+
+if effective_nx {
+    nx_entries += 1;
+}
+
+            
             let physical_base =
                 address_bits & !((1u64 << 30) - 1);
 
@@ -865,6 +899,15 @@ while pml4_index < 512 {
                         if (entry & 1) != 0 {
                             directory_present += 1;
 
+                            let pde_writable =
+    effective_writable && (entry & (1 << 1)) != 0;
+
+let pde_user =
+    effective_user && (entry & (1 << 2)) != 0;
+
+let pde_nx =
+    effective_nx || (entry & (1u64 << 63)) != 0;
+
                             let writable = (entry >> 1) & 1;
                             let user = (entry >> 2) & 1;
                             let page_size = (entry >> 7) & 1;
@@ -906,6 +949,21 @@ while pml4_index < 512 {
                                 }
 
                                huge_pages += 1;
+
+leaf_entries += 1;
+
+if pde_writable {
+    writable_entries += 1;
+}
+
+if pde_user {
+    user_entries += 1;
+}
+
+if pde_nx {
+    nx_entries += 1;
+}
+                                
                             } else {
                                 // Pointer to a page table.
                                 let table_physical =
@@ -947,6 +1005,30 @@ while pml4_index < 512 {
 
             if (entry & 1) != 0 {
                 table_present += 1;
+
+let pte_writable =
+    pde_writable && (entry & (1 << 1)) != 0;
+
+let pte_user =
+    pde_user && (entry & (1 << 2)) != 0;
+
+let pte_nx =
+    pde_nx || (entry & (1u64 << 63)) != 0;
+
+leaf_entries += 1;
+
+if pte_writable {
+    writable_entries += 1;
+}
+
+if pte_user {
+    user_entries += 1;
+}
+
+if pte_nx {
+    nx_entries += 1;
+}
+                
 
                 let nx = (entry >> 63) & 1;
 
@@ -1058,7 +1140,38 @@ while pml4_index < 512 {
 serial_write("[MM] PDPT inspection complete.\r\n");
 serial_write("[MM] PDPT tables inspected: ");
 serial_write_u64(pdpt_count);
-serial_write("\r\n");   
+serial_write("\r\n");  
+
+serial_write("[MM] Effective permission analysis:\r\n");
+
+serial_write("[MM] Leaf entries: ");
+serial_write_u64(leaf_entries);
+serial_write("\r\n");
+
+serial_write("[MM] Writable leaf entries: ");
+serial_write_u64(writable_entries);
+serial_write("\r\n");
+
+serial_write("[MM] User-accessible leaf entries: ");
+serial_write_u64(user_entries);
+serial_write("\r\n");
+
+serial_write("[MM] NX leaf entries: ");
+serial_write_u64(nx_entries);
+serial_write("\r\n");
+
+if writable_entries > leaf_entries
+    || user_entries > leaf_entries
+    || nx_entries > leaf_entries
+{
+    serial_write("[MM] ERROR: Permission statistics inconsistent.\r\n");
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+serial_write("[MM] Effective permission analysis PASSED.\r\n");
+            
 
             serial_write(
                 "[MM] Present PML4 entry inspection completed.\r\n"

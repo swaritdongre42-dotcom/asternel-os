@@ -437,6 +437,60 @@ pub fn executable_file_address_info() -> Option<(u64, u64)> {
     }
 }
 
+
+pub fn physical_range_to_virtual(
+    physical_address: u64,
+    length: u64,
+) -> Option<*mut u8> {
+    if length == 0 {
+        return None;
+    }
+
+    let physical_end = physical_address.checked_add(length)?;
+
+    // Ensure the complete range is contained in one memory-map entry.
+    let (_, entry_count, _) = memmap_response_info()?;
+
+    let mut index = 0;
+
+    let mut range_classified = false;
+
+    while index < entry_count {
+        let (base, entry_length, entry_type) = memmap_entry_at(index)?;
+
+        let entry_end = base.checked_add(entry_length)?;
+
+       if physical_address >= base
+    && physical_end <= entry_end
+    && is_hhdm_mapped_memory_type(entry_type)
+{
+    range_classified = true;
+    break;
+}
+
+        index += 1;
+    }
+
+    if !range_classified {
+        return None;
+    }
+
+    // Convert the first and last byte independently.
+    let first_virtual = physical_to_virtual(physical_address)?;
+    let last_physical = physical_end.checked_sub(1)?;
+    let last_virtual = physical_to_virtual(last_physical)?;
+
+    // Verify that the converted range is contiguous.
+    let expected_last = (first_virtual as u64)
+        .checked_add(length.checked_sub(1)?)?;
+
+    if expected_last != last_virtual as u64 {
+        return None;
+    }
+
+    Some(first_virtual)
+}
+
 pub fn physical_to_virtual(
     physical_address: u64,
 ) -> Option<*mut u8> {
@@ -445,7 +499,6 @@ pub fn physical_to_virtual(
     let virtual_address =
         hhdm_offset.checked_add(physical_address)?;
 
-    // Verify x86-64 canonical address.
     let upper = virtual_address >> 48;
     let sign_bit = (virtual_address >> 47) & 1;
 
@@ -461,6 +514,7 @@ pub fn physical_to_virtual(
 
     Some(virtual_address as *mut u8)
 }
+
 
 
 
@@ -584,4 +638,14 @@ let linker_end =
     }
 
     Err(KernelReservationError::KernelRangeNotFound)
+}
+
+pub fn is_hhdm_mapped_memory_type(entry_type: u64) -> bool {
+    matches!(
+        entry_type,
+        LIMINE_MEMMAP_USABLE
+            | LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE
+            | LIMINE_MEMMAP_EXECUTABLE_AND_MODULES
+            | LIMINE_MEMMAP_FRAMEBUFFER
+    )
 }

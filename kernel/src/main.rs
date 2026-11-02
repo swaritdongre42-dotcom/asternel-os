@@ -526,8 +526,24 @@ limine::KernelReservationError::VirtualBaseMismatch =>
 
    
     match limine::physical_to_virtual(root_page) {
-        Some(root_virtual) => {
-            let pml4 = root_virtual as *const u64;
+        Some(_) => {
+           let pml4_virtual = match limine::physical_range_to_virtual(
+    root_page,
+    limine::PAGE_SIZE,
+) {
+    Some(address) => address,
+    None => {
+        serial_write("[MM] ERROR: PML4 HHDM range validation failed.\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+};
+
+let pml4 = pml4_virtual as *const u64;
+serial_write("[MM] PML4 HHDM range validation PASSED.\r\n");
+
+            
             let mut present_count = 0u64;
             let mut index = 0usize;
 
@@ -673,6 +689,193 @@ limine::KernelReservationError::VirtualBaseMismatch =>
             }
 
             serial_write("[MM] PML4 validation PASSED.\r\n");
+
+         serial_write("[MM] Inspecting child PDPT tables...\r\n");
+
+let mut pdpt_count = 0u64;
+let mut pml4_index = 0usize;
+
+while pml4_index < 512 {
+    let pml4_entry =
+        unsafe { core::ptr::read_volatile(pml4.add(pml4_index)) };
+
+    if (pml4_entry & 1) != 0 {
+        let child_physical =
+            pml4_entry & 0x000F_FFFF_FFFF_F000;
+
+        let child_virtual =
+            match limine::physical_range_to_virtual(
+                child_physical,
+                limine::PAGE_SIZE,
+            ) {
+                Some(address) => address,
+                None => {
+                    serial_write(
+                        "[MM] ERROR: PDPT HHDM validation failed.\r\n"
+                    );
+                    loop {
+                        core::hint::spin_loop();
+                    }
+                }
+            };
+
+        let pdpt = child_virtual as *const u64;
+        let mut present_entries = 0u64;
+        let mut entry_index = 0usize;
+
+       while entry_index < 512 {
+    let entry =
+        unsafe {
+            core::ptr::read_volatile(pdpt.add(entry_index))
+        };
+
+    if (entry & 1) != 0 {
+        present_entries += 1;
+
+        let writable = (entry >> 1) & 1;
+        let user = (entry >> 2) & 1;
+        let page_size = (entry >> 7) & 1;
+        let nx = (entry >> 63) & 1;
+
+        let address_bits =
+            entry & 0x000F_FFFF_FFFF_F000;
+
+        let address_mask = match physical_address_width()
+            .and_then(physical_address_mask)
+        {
+            Some(mask) => mask,
+            None => {
+                serial_write(
+                    "[MM] ERROR: Physical address mask unavailable.\r\n"
+                );
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
+        };
+
+        if (address_bits & !address_mask) != 0 {
+            serial_write(
+                "[MM] ERROR: PDPT entry has out-of-range address bits.\r\n"
+            );
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+
+        if nx != 0 && !nx_enabled() {
+            serial_write(
+                "[MM] ERROR: NX set but NX is unavailable.\r\n"
+            );
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+
+        serial_write("[MM] PDPT entry index: ");
+        serial_write_u64(entry_index as u64);
+        serial_write("\r\n");
+
+        serial_write("[MM] Writable: ");
+        serial_write_u64(writable);
+        serial_write(" | User: ");
+        serial_write_u64(user);
+        serial_write(" | NX: ");
+        serial_write_u64(nx);
+        serial_write("\r\n");
+
+        if page_size != 0 {
+            // 1 GiB huge-page mapping.
+            let reserved_address_bits =
+                entry & 0x0000_0000_3FFF_E000;
+
+            if reserved_address_bits != 0 {
+                serial_write(
+                    "[MM] ERROR: Invalid 1 GiB page alignment.\r\n"
+                );
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
+
+            let physical_base =
+                address_bits & !((1u64 << 30) - 1);
+
+            if physical_base == 0 {
+                serial_write(
+                    "[MM] ERROR: Invalid huge-page physical base.\r\n"
+                );
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
+
+            serial_write("[MM] Mapping type: 1 GiB HUGE PAGE\r\n");
+            serial_write("[MM] Physical base: ");
+            serial_write_u64(physical_base);
+            serial_write("\r\n");
+        } else {
+            // Pointer to a page directory.
+            let directory_physical =
+                address_bits & address_mask;
+
+            if directory_physical == 0 {
+                serial_write(
+                    "[MM] ERROR: Invalid page-directory address.\r\n"
+                );
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
+
+            match limine::physical_range_to_virtual(
+                directory_physical,
+                limine::PAGE_SIZE,
+            ) {
+                Some(_) => {
+                    serial_write(
+                        "[MM] Mapping type: PAGE DIRECTORY POINTER\r\n"
+                    );
+                    serial_write(
+                        "[MM] Page-directory HHDM range validation PASSED.\r\n"
+                    );
+                    serial_write("[MM] Directory physical address: ");
+                    serial_write_u64(directory_physical);
+                    serial_write("\r\n");
+                }
+                None => {
+                    serial_write(
+                        "[MM] ERROR: Page-directory HHDM validation failed.\r\n"
+                    );
+                    loop {
+                        core::hint::spin_loop();
+                    }
+                }
+            }
+        }
+    }
+
+    entry_index += 1;
+}
+
+        pdpt_count += 1;
+
+        serial_write("[MM] PDPT for PML4 index: ");
+        serial_write_u64(pml4_index as u64);
+        serial_write("\r\n");
+
+        serial_write("[MM] PDPT present entries: ");
+        serial_write_u64(present_entries);
+        serial_write("\r\n");
+    }
+
+    pml4_index += 1;
+}
+
+serial_write("[MM] PDPT inspection complete.\r\n");
+serial_write("[MM] PDPT tables inspected: ");
+serial_write_u64(pdpt_count);
+serial_write("\r\n");   
 
             serial_write(
                 "[MM] Present PML4 entry inspection completed.\r\n"

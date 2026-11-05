@@ -316,6 +316,437 @@ fn inspect_ia32_pat() -> bool {
 
 
 
+
+fn supports_mtrr() -> bool {
+    use core::arch::x86_64::__cpuid;
+
+    let max_leaf = __cpuid(0).eax;
+
+    if max_leaf < 1 {
+        return false;
+    }
+
+    let features = __cpuid(1);
+
+    // CPUID.01H:EDX.MTRR — bit 12.
+    (features.edx & (1 << 12)) != 0
+}
+
+const IA32_MTRRCAP: u32 = 0xFE;
+const IA32_MTRR_DEF_TYPE: u32 = 0x2FF;
+
+fn read_msr(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+
+    ((high as u64) << 32) | low as u64
+}
+
+fn mtrr_memory_type_name(
+    memory_type: u8,
+    wc_supported: bool,
+) -> Option<&'static str> {
+    match memory_type {
+        0 => Some("UC"),
+        1 if wc_supported => Some("WC"),
+        4 => Some("WT"),
+        5 => Some("WP"),
+        6 => Some("WB"),
+        _ => None,
+    }
+}
+
+fn inspect_mtrr_global() -> bool {
+    serial_write("[MTRR] Starting configuration inspection...\r\n");
+
+    if !supports_mtrr() {
+        serial_write("[MTRR] CPU does not support MTRRs. Skipped.\r\n");
+        return true;
+    }
+
+    let capabilities = read_msr(IA32_MTRRCAP);
+    let default_type = read_msr(IA32_MTRR_DEF_TYPE);
+
+    // IA32_MTRRCAP:
+    // Bits 0-8, 10, and 11 are defined.
+    const CAP_ALLOWED_MASK: u64 = 0xDFF;
+
+    if (capabilities & !CAP_ALLOWED_MASK) != 0 {
+        serial_write("[MTRR] ERROR: Reserved capability bits are set.\r\n");
+        return false;
+    }
+
+    let variable_count = capabilities & 0xFF;
+    let fixed_supported = (capabilities & (1 << 8)) != 0;
+    let wc_supported = (capabilities & (1 << 10)) != 0;
+    let smrr_supported = (capabilities & (1 << 11)) != 0;
+
+    serial_write("[MTRR] Variable range registers: ");
+    serial_write_u64(variable_count);
+    serial_write("\r\n");
+
+    serial_write("[MTRR] Fixed ranges supported: ");
+    serial_write_u64(fixed_supported as u64);
+    serial_write("\r\n");
+
+    serial_write("[MTRR] Write-combining supported: ");
+    serial_write_u64(wc_supported as u64);
+    serial_write("\r\n");
+
+    serial_write("[MTRR] SMRR supported: ");
+    serial_write_u64(smrr_supported as u64);
+    serial_write("\r\n");
+
+    // IA32_MTRR_DEF_TYPE:
+    // Bits 0-7, 10, and 11 are defined.
+    const DEF_TYPE_ALLOWED_MASK: u64 = 0xCFF;
+
+    if default_type & !DEF_TYPE_ALLOWED_MASK != 0 {
+        serial_write("[MTRR] ERROR: Reserved default-type bits are set.\r\n");
+        return false;
+    }
+
+    let memory_type = (default_type & 0xFF) as u8;
+    let fixed_enabled = (default_type & (1 << 10)) != 0;
+    let mtrr_enabled = (default_type & (1 << 11)) != 0;
+
+    serial_write("[MTRR] Default memory type: ");
+
+    match mtrr_memory_type_name(memory_type, wc_supported) {
+        Some(name) => {
+            serial_write(name);
+            serial_write("\r\n");
+        }
+        None => {
+            serial_write("[MTRR] ERROR: Invalid default memory type.\r\n");
+            return false;
+        }
+    }
+
+    if fixed_enabled && !fixed_supported {
+        serial_write("[MTRR] ERROR: Fixed ranges enabled but unsupported.\r\n");
+        return false;
+    }
+
+    serial_write("[MTRR] Fixed ranges enabled: ");
+    serial_write_u64(fixed_enabled as u64);
+    serial_write("\r\n");
+
+    serial_write("[MTRR] MTRRs enabled: ");
+    serial_write_u64(mtrr_enabled as u64);
+    serial_write("\r\n");
+
+    serial_write("[MTRR] Global register validation PASSED.\r\n");
+
+    true
+}
+
+
+const FIXED_MTRR_REGISTERS: [(u32, &str); 11] = [
+    (0x250, "IA32_MTRR_FIX64K_00000"),
+    (0x258, "IA32_MTRR_FIX16K_80000"),
+    (0x259, "IA32_MTRR_FIX16K_A0000"),
+    (0x268, "IA32_MTRR_FIX4K_C0000"),
+    (0x269, "IA32_MTRR_FIX4K_C8000"),
+    (0x26A, "IA32_MTRR_FIX4K_D0000"),
+    (0x26B, "IA32_MTRR_FIX4K_D8000"),
+    (0x26C, "IA32_MTRR_FIX4K_E0000"),
+    (0x26D, "IA32_MTRR_FIX4K_E8000"),
+    (0x26E, "IA32_MTRR_FIX4K_F0000"),
+    (0x26F, "IA32_MTRR_FIX4K_F8000"),
+];
+
+fn inspect_mtrr_fixed_ranges() -> bool {
+    serial_write("[MTRR] Starting fixed-range inspection...\r\n");
+
+    if !supports_mtrr() {
+        serial_write("[MTRR] Fixed-range inspection skipped: MTRR unsupported.\r\n");
+        return true;
+    }
+
+    let capabilities = read_msr(IA32_MTRRCAP);
+    let default_type = read_msr(IA32_MTRR_DEF_TYPE);
+
+    let fixed_supported = (capabilities & (1 << 8)) != 0;
+    let mtrr_enabled = (default_type & (1 << 11)) != 0;
+    let fixed_enabled = (default_type & (1 << 10)) != 0;
+    let wc_supported = (capabilities & (1 << 10)) != 0;
+
+    if !fixed_supported {
+        serial_write("[MTRR] Fixed ranges are unsupported. Skipped.\r\n");
+        return true;
+    }
+
+    if !mtrr_enabled || !fixed_enabled {
+        serial_write("[MTRR] Fixed ranges are not active. Inspection skipped.\r\n");
+        return true;
+    }
+
+    let mut register_index = 0usize;
+    let mut valid = true;
+
+    while register_index < FIXED_MTRR_REGISTERS.len() {
+        let (msr, register_name) =
+            FIXED_MTRR_REGISTERS[register_index];
+
+        let value = read_msr(msr);
+
+        serial_write("[MTRR] Register: ");
+        serial_write(register_name);
+        serial_write("\r\n");
+
+        let mut entry_index = 0u32;
+
+        while entry_index < 8 {
+            let memory_type =
+                ((value >> (entry_index * 8)) & 0xFF) as u8;
+
+            serial_write("[MTRR]   Entry ");
+            serial_write_u64(entry_index as u64);
+            serial_write(": ");
+
+            match mtrr_memory_type_name(
+                memory_type,
+                wc_supported,
+            ) {
+                Some(name) => {
+                    serial_write(name);
+                    serial_write(" (");
+                    serial_write_u64(memory_type as u64);
+                    serial_write(")\r\n");
+                }
+                None => {
+                    serial_write("INVALID ENCODING (");
+                    serial_write_u64(memory_type as u64);
+                    serial_write(")\r\n");
+
+                    valid = false;
+                }
+            }
+
+            entry_index += 1;
+        }
+
+        register_index += 1;
+    }
+
+    if valid {
+        serial_write("[MTRR] Fixed-range validation PASSED.\r\n");
+    } else {
+        serial_write("[MTRR] ERROR: Invalid fixed-range memory type.\r\n");
+    }
+
+    valid
+}
+
+
+
+fn inspect_mtrr_variable_ranges() -> bool {
+    serial_write("[MTRR] Starting variable-range inspection...\r\n");
+
+    if !supports_mtrr() {
+        serial_write("[MTRR] Variable-range inspection skipped: MTRR unsupported.\r\n");
+        return true;
+    }
+
+    let capabilities = read_msr(IA32_MTRRCAP);
+
+    const CAP_ALLOWED_MASK: u64 = 0xDFF;
+
+    if capabilities & !CAP_ALLOWED_MASK != 0 {
+        serial_write("[MTRR] ERROR: Reserved capability bits are set.\r\n");
+        return false;
+    }
+
+    let variable_count = (capabilities & 0xFF) as u32;
+    let wc_supported = (capabilities & (1 << 10)) != 0;
+
+    let default_type = read_msr(IA32_MTRR_DEF_TYPE);
+    let mtrr_enabled = (default_type & (1 << 11)) != 0;
+
+    let address_width = match physical_address_width() {
+        Some(width) => width,
+        None => {
+            serial_write("[MTRR] ERROR: Physical address width unavailable.\r\n");
+            return false;
+        }
+    };
+
+    let address_mask = match physical_address_mask(address_width) {
+        Some(mask) => mask,
+        None => {
+            serial_write("[MTRR] ERROR: Physical address mask unavailable.\r\n");
+            return false;
+        }
+    };
+
+    let field_width = (address_width - 12) as u32;
+    let field_mask = (1u64 << field_width) - 1;
+
+    serial_write("[MTRR] Variable register pairs: ");
+    serial_write_u64(variable_count as u64);
+    serial_write("\r\n");
+
+    serial_write("[MTRR] Physical address width: ");
+    serial_write_u64(address_width as u64);
+    serial_write(" bits\r\n");
+
+    if !mtrr_enabled {
+        serial_write("[MTRR] Global MTRR enable is disabled; configurations are inactive.\r\n");
+    }
+
+    let mut index = 0u32;
+    let mut enabled_count = 0u32;
+    let mut disabled_count = 0u32;
+    let mut irregular_count = 0u32;
+    let mut valid = true;
+
+    while index < variable_count {
+        let base_msr = 0x200 + index * 2;
+        let mask_msr = base_msr + 1;
+
+        let base_value = read_msr(base_msr);
+        let mask_value = read_msr(mask_msr);
+
+        serial_write("[MTRR] Variable range ");
+        serial_write_u64(index as u64);
+        serial_write("\r\n");
+
+        // Base:
+        // Bits 7:0 are the memory type.
+        // Bits 11:8 and bits above MAXPHYADDR are reserved.
+        let base_reserved_mask = !(address_mask | 0xFF);
+
+        if (base_value & base_reserved_mask) != 0 {
+            serial_write("[MTRR] ERROR: Reserved base-register bits are set.\r\n");
+            valid = false;
+        }
+
+        // Mask:
+        // Bit 11 is Valid.
+        // Bits 10:0 and bits above MAXPHYADDR are reserved.
+        let mask_reserved_mask = !(address_mask | (1 << 11));
+
+        if (mask_value & mask_reserved_mask) != 0 {
+            serial_write("[MTRR] ERROR: Reserved mask-register bits are set.\r\n");
+            valid = false;
+        }
+
+        let range_enabled = (mask_value & (1 << 11)) != 0;
+
+        if !range_enabled {
+            serial_write("[MTRR]   Status: DISABLED\r\n");
+            disabled_count += 1;
+            index += 1;
+            continue;
+        }
+
+        enabled_count += 1;
+
+        let memory_type = (base_value & 0xFF) as u8;
+
+        serial_write("[MTRR]   Memory type: ");
+
+        match mtrr_memory_type_name(memory_type, wc_supported) {
+            Some(name) => {
+                serial_write(name);
+                serial_write("\r\n");
+            }
+            None => {
+                serial_write("[MTRR] ERROR: Invalid variable-range memory type.\r\n");
+                valid = false;
+            }
+        }
+
+        let physical_base = base_value & address_mask;
+        let physical_mask = mask_value & address_mask;
+
+        serial_write("[MTRR]   Physical base: ");
+        serial_write_u64(physical_base);
+        serial_write("\r\n");
+
+        serial_write("[MTRR]   Physical mask: ");
+        serial_write_u64(physical_mask);
+        serial_write("\r\n");
+
+        // Convert the address mask into page-number bits.
+        let mask_units = physical_mask >> 12;
+
+        // A conventional contiguous MTRR mask has leading ones
+        // followed by trailing zeros.
+        let inverted_mask = (!mask_units) & field_mask;
+
+        let contiguous =
+            (inverted_mask & (inverted_mask + 1)) == 0;
+
+        if contiguous {
+            let size_pages = inverted_mask + 1;
+            let range_size = size_pages << 12;
+
+            serial_write("[MTRR]   Mask pattern: CONTIGUOUS\r\n");
+
+            serial_write("[MTRR]   Range size: ");
+            serial_write_u64(range_size);
+            serial_write(" bytes\r\n");
+
+            if (physical_base & (range_size - 1)) != 0 {
+                serial_write("[MTRR] ERROR: Base address is not aligned to the range size.\r\n");
+                valid = false;
+            } else {
+                serial_write("[MTRR]   Base alignment: PASSED\r\n");
+            }
+        } else {
+            // Intel documents non-contiguous masks. They are
+            // unusual, but must not be rejected solely for this.
+            serial_write("[MTRR]   Mask pattern: NON-CONTIGUOUS\r\n");
+            serial_write("[MTRR]   Warning: Irregular range mask; no simple range size reported.\r\n");
+
+            irregular_count += 1;
+        }
+
+        if mtrr_enabled {
+            serial_write("[MTRR]   Configuration: ENABLED AND ACTIVE\r\n");
+        } else {
+            serial_write("[MTRR]   Configuration: VALID BUT GLOBALLY INACTIVE\r\n");
+        }
+
+        index += 1;
+    }
+
+    serial_write("[MTRR] Enabled variable ranges: ");
+    serial_write_u64(enabled_count as u64);
+    serial_write("\r\n");
+
+    serial_write("[MTRR] Disabled variable ranges: ");
+    serial_write_u64(disabled_count as u64);
+    serial_write("\r\n");
+
+    serial_write("[MTRR] Non-contiguous masks: ");
+    serial_write_u64(irregular_count as u64);
+    serial_write("\r\n");
+
+    if valid {
+        serial_write("[MTRR] Variable-range validation PASSED.\r\n");
+    } else {
+        serial_write("[MTRR] ERROR: Variable-range validation FAILED.\r\n");
+    }
+
+    valid
+}
+
+
+
+
 // Kernel entry point
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -331,6 +762,31 @@ pub extern "C" fn _start() -> ! {
             core::hint::spin_loop();
         }
     }
+
+    if !inspect_mtrr_global() {
+    serial_write("[MTRR] Kernel initialization halted.\r\n");
+
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+if !inspect_mtrr_fixed_ranges() {
+    serial_write("[MTRR] Fixed-range inspection halted.\r\n");
+
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+if !inspect_mtrr_variable_ranges() {
+    serial_write("[MTRR] Variable-range inspection halted.\r\n");
+
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 
     // Executable-file response
    serial_write("[KERNEL] Checking executable-address response...\r\n");
@@ -395,7 +851,7 @@ limine::KernelReservationError::VirtualBaseMismatch =>
     }
 }
 
-    
+
 
     // HHDM response
     serial_write("[HHDM] Checking Higher Half Direct Map...\r\n");
@@ -543,10 +999,10 @@ limine::KernelReservationError::VirtualBaseMismatch =>
         }
     }
 
-    
-    
+
+
     // Read-only active page-table root discovery
-   
+
     // Read-only active page-table root discovery and validation
     serial_write("[MM] Validating active CR3 register...\r\n");
 
@@ -685,7 +1141,7 @@ limine::KernelReservationError::VirtualBaseMismatch =>
     // Read-only PML4 inspection
     serial_write("[MM] Inspecting PML4 root entries...\r\n");
 
-   
+
     match limine::physical_to_virtual(root_page) {
         Some(_) => {
            let pml4_virtual = match limine::physical_range_to_virtual(
@@ -704,7 +1160,7 @@ limine::KernelReservationError::VirtualBaseMismatch =>
 let pml4 = pml4_virtual as *const u64;
 serial_write("[MM] PML4 HHDM range validation PASSED.\r\n");
 
-            
+
             let mut present_count = 0u64;
             let mut index = 0usize;
 
@@ -727,7 +1183,7 @@ serial_write("[MM] PML4 HHDM range validation PASSED.\r\n");
             serial_write("[MM] PML4 root inspection completed.\r\n");
 
             // Inspect present entries without dereferencing child tables.
-           
+
             // Validate present PML4 entries without dereferencing children.
             serial_write("[MM] Validating present PML4 entries...\r\n");
 
@@ -855,7 +1311,7 @@ serial_write("[MM] PML4 HHDM range validation PASSED.\r\n");
 
 let mut pdpt_count = 0u64;
 let mut pml4_index = 0usize;
-            
+
  let mut leaf_entries = 0u64;
 let mut writable_entries = 0u64;
 let mut user_entries = 0u64;
@@ -864,7 +1320,7 @@ let mut nx_entries = 0u64;
 let mut validated_1g = 0u64;
 let mut validated_2m = 0u64;
 let mut validated_4k = 0u64;
-            
+
 while pml4_index < 512 {
     let pml4_entry =
         unsafe { core::ptr::read_volatile(pml4.add(pml4_index)) };
@@ -874,7 +1330,7 @@ while pml4_index < 512 {
 let pml4_writable = (pml4_entry & (1 << 1)) != 0;
 let pml4_user = (pml4_entry & (1 << 2)) != 0;
 let pml4_nx = (pml4_entry & (1u64 << 63)) != 0;
-        
+
         let child_physical =
             pml4_entry & 0x000F_FFFF_FFFF_F000;
 
@@ -1015,7 +1471,7 @@ if effective_nx {
     nx_entries += 1;
 }
 
-            
+
             let physical_base =
                 address_bits & !((1u64 << 30) - 1);
 
@@ -1034,7 +1490,7 @@ if effective_nx {
 
 validated_1g += 1;
 
-            
+
 
             serial_write("[MM] Mapping type: 1 GiB HUGE PAGE\r\n");
             serial_write("[MM] Physical base: ");
@@ -1184,7 +1640,7 @@ if !validate_leaf_physical_range(
 
 validated_2m += 1;
 
-                                
+
                                huge_pages += 1;
 
 leaf_entries += 1;
@@ -1200,7 +1656,7 @@ if pde_user {
 if pde_nx {
     nx_entries += 1;
 }
-                                
+
                             } else {
                                 // Pointer to a page table.
                                 let table_physical =
@@ -1265,7 +1721,7 @@ if pte_user {
 if pte_nx {
     nx_entries += 1;
 }
-                
+
 
                 let nx = (entry >> 63) & 1;
 
@@ -1278,7 +1734,7 @@ if (entry & (1u64 << 7)) != 0 && !supports_pat() {
         core::hint::spin_loop();
     }
 }
-                
+
                 let address_bits =
                     entry & 0x000F_FFFF_FFFF_F000;
 
@@ -1320,7 +1776,7 @@ if !validate_leaf_physical_range(
 
 validated_4k += 1;
 
-                
+
             }
 
             table_index += 1;
@@ -1453,9 +1909,9 @@ serial_write("\r\n");
 
 serial_write("[MM] Physical mapping validation PASSED.\r\n");
 
-            
+
 serial_write("[MM] Effective permission analysis PASSED.\r\n");
-            
+
 
             serial_write(
                 "[MM] Present PML4 entry inspection completed.\r\n"
@@ -1468,8 +1924,8 @@ serial_write("[MM] Effective permission analysis PASSED.\r\n");
     }
 
 
-    
-    
+
+
     // Physical memory statistics
     match limine::calculate_memmap_stats() {
         Ok(stats) => {

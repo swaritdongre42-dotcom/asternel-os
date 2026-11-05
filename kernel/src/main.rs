@@ -189,6 +189,38 @@ fn nx_enabled() -> bool {
     (efer & (1 << 11)) != 0
 }
 
+fn supports_2m_pages() -> bool {
+    use core::arch::x86_64::__cpuid;
+
+    let features = __cpuid(0x00000001);
+
+    // CPUID.01H:EDX.PSE — bit 3.
+    (features.edx & (1 << 3)) != 0
+}
+
+fn supports_1g_pages() -> bool {
+    use core::arch::x86_64::__cpuid;
+
+    let max_leaf = __cpuid(0x80000000).eax;
+
+    if max_leaf < 0x80000001 {
+        return false;
+    }
+
+    let features = __cpuid(0x80000001);
+
+    // CPUID.80000001H:EDX.PDPE1GB — bit 26.
+    (features.edx & (1 << 26)) != 0
+}
+
+fn supports_pat() -> bool {
+    use core::arch::x86_64::__cpuid;
+
+    let features = __cpuid(0x00000001);
+
+    // CPUID.01H:EDX.PAT — bit 16.
+    (features.edx & (1 << 16)) != 0
+}
 
 
 
@@ -262,7 +294,7 @@ limine::KernelReservationError::VirtualBaseMismatch =>
     }
 }
 
-
+    
 
     // HHDM response
     serial_write("[HHDM] Checking Higher Half Direct Map...\r\n");
@@ -410,10 +442,10 @@ limine::KernelReservationError::VirtualBaseMismatch =>
         }
     }
 
-
-
+    
+    
     // Read-only active page-table root discovery
-
+   
     // Read-only active page-table root discovery and validation
     serial_write("[MM] Validating active CR3 register...\r\n");
 
@@ -552,7 +584,7 @@ limine::KernelReservationError::VirtualBaseMismatch =>
     // Read-only PML4 inspection
     serial_write("[MM] Inspecting PML4 root entries...\r\n");
 
-
+   
     match limine::physical_to_virtual(root_page) {
         Some(_) => {
            let pml4_virtual = match limine::physical_range_to_virtual(
@@ -571,7 +603,7 @@ limine::KernelReservationError::VirtualBaseMismatch =>
 let pml4 = pml4_virtual as *const u64;
 serial_write("[MM] PML4 HHDM range validation PASSED.\r\n");
 
-
+            
             let mut present_count = 0u64;
             let mut index = 0usize;
 
@@ -594,7 +626,7 @@ serial_write("[MM] PML4 HHDM range validation PASSED.\r\n");
             serial_write("[MM] PML4 root inspection completed.\r\n");
 
             // Inspect present entries without dereferencing child tables.
-
+           
             // Validate present PML4 entries without dereferencing children.
             serial_write("[MM] Validating present PML4 entries...\r\n");
 
@@ -722,7 +754,7 @@ serial_write("[MM] PML4 HHDM range validation PASSED.\r\n");
 
 let mut pdpt_count = 0u64;
 let mut pml4_index = 0usize;
-
+            
  let mut leaf_entries = 0u64;
 let mut writable_entries = 0u64;
 let mut user_entries = 0u64;
@@ -731,7 +763,7 @@ let mut nx_entries = 0u64;
 let mut validated_1g = 0u64;
 let mut validated_2m = 0u64;
 let mut validated_4k = 0u64;
-
+            
 while pml4_index < 512 {
     let pml4_entry =
         unsafe { core::ptr::read_volatile(pml4.add(pml4_index)) };
@@ -741,7 +773,7 @@ while pml4_index < 512 {
 let pml4_writable = (pml4_entry & (1 << 1)) != 0;
 let pml4_user = (pml4_entry & (1 << 2)) != 0;
 let pml4_nx = (pml4_entry & (1u64 << 63)) != 0;
-
+        
         let child_physical =
             pml4_entry & 0x000F_FFFF_FFFF_F000;
 
@@ -836,6 +868,26 @@ let effective_nx =
         serial_write("\r\n");
 
         if page_size != 0 {
+
+            if !supports_1g_pages() {
+    serial_write(
+        "[MM] ERROR: CPU does not support 1 GiB pages.\r\n"
+    );
+    loop {
+        core::hint::spin_loop();
+    }
+
+
+                // Bit 12 is the PAT selector for a 1 GiB page.
+if (entry & (1u64 << 12)) != 0 && !supports_pat() {
+    serial_write(
+        "[MM] ERROR: 1 GiB page uses PAT but CPU lacks PAT support.\r\n"
+    );
+    loop {
+        core::hint::spin_loop();
+    }
+}
+}
             // 1 GiB huge-page mapping.
             let reserved_address_bits =
                 entry & 0x0000_0000_3FFF_E000;
@@ -863,7 +915,7 @@ if effective_nx {
     nx_entries += 1;
 }
 
-
+            
             let physical_base =
                 address_bits & !((1u64 << 30) - 1);
 
@@ -882,7 +934,7 @@ if effective_nx {
 
 validated_1g += 1;
 
-
+            
 
             serial_write("[MM] Mapping type: 1 GiB HUGE PAGE\r\n");
             serial_write("[MM] Physical base: ");
@@ -982,6 +1034,25 @@ let pde_nx =
                             }
 
                             if page_size != 0 {
+
+                                if !supports_2m_pages() {
+    serial_write(
+        "[MM] ERROR: CPU does not support 2 MiB pages.\r\n"
+    );
+    loop {
+        core::hint::spin_loop();
+    }
+
+                                    // Bit 12 is the PAT selector for a 2 MiB page.
+if (entry & (1u64 << 12)) != 0 && !supports_pat() {
+    serial_write(
+        "[MM] ERROR: 2 MiB page uses PAT but CPU lacks PAT support.\r\n"
+    );
+    loop {
+        core::hint::spin_loop();
+    }
+}
+}
                                 // 2 MiB huge-page mapping.
                                 let reserved_bits =
                                     entry & 0x0000_0000_001F_E000;
@@ -1013,7 +1084,7 @@ if !validate_leaf_physical_range(
 
 validated_2m += 1;
 
-
+                                
                                huge_pages += 1;
 
 leaf_entries += 1;
@@ -1029,7 +1100,7 @@ if pde_user {
 if pde_nx {
     nx_entries += 1;
 }
-
+                                
                             } else {
                                 // Pointer to a page table.
                                 let table_physical =
@@ -1094,10 +1165,20 @@ if pte_user {
 if pte_nx {
     nx_entries += 1;
 }
-
+                
 
                 let nx = (entry >> 63) & 1;
 
+// Bit 7 is the PAT selector in a 4 KiB PTE.
+if (entry & (1u64 << 7)) != 0 && !supports_pat() {
+    serial_write(
+        "[MM] ERROR: 4 KiB page uses PAT but CPU lacks PAT support.\r\n"
+    );
+    loop {
+        core::hint::spin_loop();
+    }
+}
+                
                 let address_bits =
                     entry & 0x000F_FFFF_FFFF_F000;
 
@@ -1139,7 +1220,7 @@ if !validate_leaf_physical_range(
 
 validated_4k += 1;
 
-
+                
             }
 
             table_index += 1;
@@ -1272,9 +1353,9 @@ serial_write("\r\n");
 
 serial_write("[MM] Physical mapping validation PASSED.\r\n");
 
-
+            
 serial_write("[MM] Effective permission analysis PASSED.\r\n");
-
+            
 
             serial_write(
                 "[MM] Present PML4 entry inspection completed.\r\n"
@@ -1287,8 +1368,8 @@ serial_write("[MM] Effective permission analysis PASSED.\r\n");
     }
 
 
-
-
+    
+    
     // Physical memory statistics
     match limine::calculate_memmap_stats() {
         Ok(stats) => {

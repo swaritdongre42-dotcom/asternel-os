@@ -869,16 +869,16 @@ let effective_nx =
 
         if page_size != 0 {
 
-            if !supports_1g_pages() {
+           if !supports_1g_pages() {
     serial_write(
         "[MM] ERROR: CPU does not support 1 GiB pages.\r\n"
     );
     loop {
         core::hint::spin_loop();
     }
+}
 
-
-                // Bit 12 is the PAT selector for a 1 GiB page.
+// Bit 12 is the PAT selector for a 1 GiB page.
 if (entry & (1u64 << 12)) != 0 && !supports_pat() {
     serial_write(
         "[MM] ERROR: 1 GiB page uses PAT but CPU lacks PAT support.\r\n"
@@ -886,7 +886,6 @@ if (entry & (1u64 << 12)) != 0 && !supports_pat() {
     loop {
         core::hint::spin_loop();
     }
-}
 }
             // 1 GiB huge-page mapping.
             let reserved_address_bits =
@@ -1042,8 +1041,9 @@ let pde_nx =
     loop {
         core::hint::spin_loop();
     }
+}
 
-                                    // Bit 12 is the PAT selector for a 2 MiB page.
+// Bit 12 is the PAT selector for a 2 MiB page.
 if (entry & (1u64 << 12)) != 0 && !supports_pat() {
     serial_write(
         "[MM] ERROR: 2 MiB page uses PAT but CPU lacks PAT support.\r\n"
@@ -1051,7 +1051,6 @@ if (entry & (1u64 << 12)) != 0 && !supports_pat() {
     loop {
         core::hint::spin_loop();
     }
-}
 }
                                 // 2 MiB huge-page mapping.
                                 let reserved_bits =

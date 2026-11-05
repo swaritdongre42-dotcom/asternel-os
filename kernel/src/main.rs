@@ -223,6 +223,98 @@ fn supports_pat() -> bool {
 }
 
 
+const IA32_PAT_MSR: u32 = 0x277;
+
+fn read_ia32_pat() -> Option<u64> {
+    if !supports_pat() {
+        return None;
+    }
+
+    let low: u32;
+    let high: u32;
+
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") IA32_PAT_MSR,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+
+    Some(((high as u64) << 32) | low as u64)
+}
+
+fn pat_memory_type_name(memory_type: u8) -> Option<&'static str> {
+    match memory_type {
+        0 => Some("UC"),
+        1 => Some("WC"),
+        2 => None,
+        3 => None,
+        4 => Some("WT"),
+        5 => Some("WP"),
+        6 => Some("WB"),
+        7 => Some("UC-"),
+        _ => None,
+    }
+}
+
+fn inspect_ia32_pat() -> bool {
+    serial_write("[PAT] Starting IA32_PAT inspection...\r\n");
+
+    if !supports_pat() {
+        serial_write("[PAT] CPU does not support PAT. Inspection skipped.\r\n");
+        return true;
+    }
+
+    let pat_value = match read_ia32_pat() {
+        Some(value) => value,
+        None => {
+            serial_write("[PAT] ERROR: Could not read IA32_PAT.\r\n");
+            return false;
+        }
+    };
+
+    let mut index = 0u32;
+    let mut valid = true;
+
+    while index < 8 {
+        let memory_type =
+            ((pat_value >> (index * 8)) & 0xFF) as u8;
+
+        serial_write("[PAT] Entry ");
+        serial_write_u64(index as u64);
+        serial_write(": ");
+
+        match pat_memory_type_name(memory_type) {
+            Some(name) => {
+                serial_write(name);
+                serial_write(" (");
+                serial_write_u64(memory_type as u64);
+                serial_write(")\r\n");
+            }
+            None => {
+                serial_write("INVALID RESERVED ENCODING (");
+                serial_write_u64(memory_type as u64);
+                serial_write(")\r\n");
+                valid = false;
+            }
+        }
+
+        index += 1;
+    }
+
+    if valid {
+        serial_write("[PAT] IA32_PAT validation PASSED.\r\n");
+    } else {
+        serial_write("[PAT] ERROR: Invalid memory-type encoding.\r\n");
+    }
+
+    valid
+}
+
+
 
 // Kernel entry point
 #[unsafe(no_mangle)]
@@ -230,6 +322,15 @@ pub extern "C" fn _start() -> ! {
     serial_init();
 
     serial_write("\r\n[BOOT] Asternel kernel started.\r\n");
+
+
+        if !inspect_ia32_pat() {
+        serial_write("[PAT] Kernel initialization halted.\r\n");
+
+        loop {
+            core::hint::spin_loop();
+        }
+    }
 
     // Executable-file response
    serial_write("[KERNEL] Checking executable-address response...\r\n");

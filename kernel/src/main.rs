@@ -366,6 +366,380 @@ fn mtrr_memory_type_name(
     }
 }
 
+fn resolve_mtrr_overlap(
+    match_count: u32,
+    first_type: u8,
+    all_same: bool,
+    has_uc: bool,
+    has_wb: bool,
+    has_wt: bool,
+    has_other: bool,
+) -> Option<u8> {
+    if match_count == 0 {
+        return None;
+    }
+
+    // Identical overlapping types resolve to that type.
+    if all_same {
+        return Some(first_type);
+    }
+
+    // UC takes precedence over other variable MTRR types.
+    if has_uc {
+        return Some(0);
+    }
+
+    // WB + WT resolves to WT.
+    if has_wb && has_wt && !has_other {
+        return Some(4);
+    }
+
+    // Other combinations have undefined behavior.
+    None
+}
+
+
+
+struct MtrrOverlapState {
+    match_count: u32,
+    first_type: u8,
+    all_same: bool,
+    has_uc: bool,
+    has_wb: bool,
+    has_wt: bool,
+    has_other: bool,
+}
+
+impl MtrrOverlapState {
+    const fn new() -> Self {
+        Self {
+            match_count: 0,
+            first_type: 0,
+            has_uc: false,
+            has_wb: false,
+            has_wt: false,
+            has_other: false,
+            all_same: true,
+        }
+    }
+
+   fn add(&mut self, memory_type: u8) {
+    if self.match_count == 0 {
+        self.first_type = memory_type;
+    } else if memory_type != self.first_type {
+        self.all_same = false;
+    }
+
+    self.match_count += 1;
+
+    match memory_type {
+        0 => self.has_uc = true,
+        4 => self.has_wt = true,
+        6 => self.has_wb = true,
+        _ => self.has_other = true,
+    }
+}
+
+    fn resolve(&self) -> Option<u8> {
+    resolve_mtrr_overlap(
+        self.match_count,
+        self.first_type,
+        self.all_same,
+        self.has_uc,
+        self.has_wb,
+        self.has_wt,
+        self.has_other,
+    )
+}
+}
+
+
+fn variable_mtrr_matches(
+    physical_address: u64,
+    base_value: u64,
+    mask_value: u64,
+    address_mask: u64,
+) -> bool {
+    // Bit 11 of the mask register enables this range.
+    if (mask_value & (1 << 11)) == 0 {
+        return false;
+    }
+
+    let physical_base = base_value & address_mask;
+    let physical_mask = mask_value & address_mask;
+
+    (physical_address & physical_mask)
+    == (physical_base & physical_mask)
+}
+
+
+fn validate_mtrr_overlap_rules() -> bool {
+    // Identical types: WB + WB = WB.
+    let mut identical = MtrrOverlapState::new();
+    identical.add(6);
+    identical.add(6);
+
+    if identical.resolve() != Some(6) {
+        return false;
+    }
+
+    // UC takes precedence over WB.
+    let mut uncached = MtrrOverlapState::new();
+    uncached.add(0);
+    uncached.add(6);
+
+    if uncached.resolve() != Some(0) {
+        return false;
+    }
+
+    // WB + WT resolves to WT.
+    let mut write_through = MtrrOverlapState::new();
+    write_through.add(6);
+    write_through.add(4);
+
+    if write_through.resolve() != Some(4) {
+        return false;
+    }
+
+    // Unsupported combination: WC + WP.
+    let mut undefined = MtrrOverlapState::new();
+    undefined.add(1);
+    undefined.add(5);
+
+    if undefined.resolve().is_some() {
+        return false;
+    }
+
+    true
+}
+
+
+
+
+fn fixed_mtrr_type_at(
+    physical_address: u64,
+    wc_supported: bool,
+) -> Option<u8> {
+    if physical_address >= 0x10_0000 {
+        return None;
+    }
+
+    let (msr, entry_index) = if physical_address < 0x80_000 {
+        (
+            0x250,
+            (physical_address >> 16) as u32,
+        )
+    } else if physical_address < 0xA_0000 {
+        (
+            0x258,
+            ((physical_address - 0x80_000) >> 14) as u32,
+        )
+    } else if physical_address < 0xC_0000 {
+        (
+            0x259,
+            ((physical_address - 0xA_0000) >> 14) as u32,
+        )
+    } else {
+        let offset = physical_address - 0xC_0000;
+
+        (
+            0x268 + (offset / 0x8000) as u32,
+            ((offset % 0x8000) / 0x1000) as u32,
+        )
+    };
+
+    let register_value = read_msr(msr);
+    let memory_type =
+        ((register_value >> (entry_index * 8)) & 0xFF) as u8;
+
+    if mtrr_memory_type_name(memory_type, wc_supported).is_some() {
+        Some(memory_type)
+    } else {
+        None
+    }
+}
+
+fn resolve_mtrr_type_at(
+    physical_address: u64,
+) -> Option<u8> {
+    if !supports_mtrr() {
+        return None;
+    }
+
+    let address_width = physical_address_width()?;
+
+    let physical_limit =
+        1u64.checked_shl(address_width as u32)?;
+
+    if physical_address >= physical_limit {
+        return None;
+    }
+
+    let address_mask =
+        physical_address_mask(address_width)?;
+
+    let capabilities = read_msr(IA32_MTRRCAP);
+
+    if capabilities & !0xDFF != 0 {
+        return None;
+    }
+
+    let variable_count =
+        (capabilities & 0xFF) as u32;
+
+    let fixed_supported =
+        (capabilities & (1 << 8)) != 0;
+
+    let wc_supported =
+        (capabilities & (1 << 10)) != 0;
+
+    let default_register =
+        read_msr(IA32_MTRR_DEF_TYPE);
+
+    if default_register & !0xCFF != 0 {
+        return None;
+    }
+
+    let default_type =
+        (default_register & 0xFF) as u8;
+
+    if mtrr_memory_type_name(
+        default_type,
+        wc_supported,
+    ).is_none() {
+        return None;
+    }
+
+    let fixed_enabled =
+        (default_register & (1 << 10)) != 0;
+
+    let mtrr_enabled =
+        (default_register & (1 << 11)) != 0;
+
+    // Disabled MTRRs mean UC for all physical memory.
+    if !mtrr_enabled {
+        return Some(0);
+    }
+
+    if fixed_enabled && !fixed_supported {
+        return None;
+    }
+
+    // Fixed ranges override variable ranges below 1 MiB.
+    if fixed_enabled && physical_address < 0x10_0000 {
+        return fixed_mtrr_type_at(
+            physical_address,
+            wc_supported,
+        );
+    }
+
+    let mut overlap = MtrrOverlapState::new();
+    let mut index = 0u32;
+
+    while index < variable_count {
+        let base_msr = 0x200 + index * 2;
+        let mask_msr = base_msr + 1;
+
+        let base_value = read_msr(base_msr);
+        let mask_value = read_msr(mask_msr);
+
+        let base_reserved_mask =
+            !(address_mask | 0xFF);
+
+        let mask_reserved_mask =
+            !(address_mask | (1 << 11));
+
+        if (base_value & base_reserved_mask) != 0
+            || (mask_value & mask_reserved_mask) != 0
+        {
+            return None;
+        }
+
+        if (mask_value & (1 << 11)) != 0 {
+            let memory_type =
+                (base_value & 0xFF) as u8;
+
+            if mtrr_memory_type_name(
+                memory_type,
+                wc_supported,
+            ).is_none() {
+                return None;
+            }
+
+            if variable_mtrr_matches(
+                physical_address,
+                base_value,
+                mask_value,
+                address_mask,
+            ) {
+                overlap.add(memory_type);
+            }
+        }
+
+        index += 1;
+    }
+
+    if overlap.match_count == 0 {
+        return Some(default_type);
+    }
+
+    overlap.resolve()
+}
+
+
+
+fn inspect_mtrr_resolution() -> bool {
+    let samples: [(&str, u64); 8] = [
+        ("0x00000000", 0x00000000),
+        ("0x00080000", 0x00080000),
+        ("0x000A0000", 0x000A0000),
+        ("0x000C0000", 0x000C0000),
+        ("0x000FFFFF", 0x000FFFFF),
+        ("0x00100000", 0x00100000),
+        ("0x00200000", 0x00200000),
+        ("0x80000000", 0x80000000),
+    ];
+
+    let mut index = 0;
+
+    while index < samples.len() {
+        let (address_label, address) = samples[index];
+
+        let memory_type = match resolve_mtrr_type_at(address) {
+            Some(memory_type) => memory_type,
+            None => {
+                serial_write(
+                    "[MTRR] Memory type resolution FAILED.\r\n"
+                );
+                return false;
+            }
+        };
+
+        let type_name =
+            match mtrr_memory_type_name(memory_type, true) {
+                Some(name) => name,
+                None => return false,
+            };
+
+        serial_write("[MTRR] ");
+        serial_write(address_label);
+        serial_write(" -> ");
+        serial_write(type_name);
+        serial_write("\r\n");
+
+        index += 1;
+    }
+
+    serial_write(
+        "[MTRR] Sample type resolution PASSED.\r\n"
+    );
+
+    true
+}
+
+
+
+
 fn inspect_mtrr_global() -> bool {
     serial_write("[MTRR] Starting configuration inspection...\r\n");
 
@@ -786,6 +1160,32 @@ if !inspect_mtrr_variable_ranges() {
         core::hint::spin_loop();
     }
 }
+
+if !validate_mtrr_overlap_rules() {
+    serial_write(
+        "[MTRR] Overlap rule validation FAILED.\r\n"
+    );
+
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+serial_write(
+    "[MTRR] Overlap rule validation PASSED.\r\n"
+);
+
+if !inspect_mtrr_resolution() {
+    serial_write(
+        "[MTRR] Kernel initialization halted.\r\n"
+    );
+
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+
 
 
     // Executable-file response
@@ -1863,7 +2263,7 @@ validated_4k += 1;
 serial_write("[MM] PDPT inspection complete.\r\n");
 serial_write("[MM] PDPT tables inspected: ");
 serial_write_u64(pdpt_count);
-serial_write("\r\n");  
+serial_write("\r\n");
 
 serial_write("[MM] Effective permission analysis:\r\n");
 

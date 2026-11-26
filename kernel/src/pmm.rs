@@ -44,6 +44,7 @@ pub struct BitmapStats {
 pub struct PmmAllocator {
     bitmap: *mut u8,
     bitmap_len: usize,
+    next_fit_frame: u64,
     bitmap_physical_start: u64,
     bitmap_pages: u64,
     total_frames: u64,
@@ -549,6 +550,7 @@ impl PmmAllocator {
             reserved_low_memory_frames,
          bitmap_physical_start: layout.bitmap_physical_start,
             bitmap_pages: layout.bitmap_pages,
+            next_fit_frame: 0,
         })
     }
 
@@ -597,18 +599,26 @@ impl PmmAllocator {
         Err(PmmError::InvalidBitmapLayout)
     }
 
-    pub fn allocate_frame(
-        &mut self,
+   
+    // Find a free frame in the half-open range [start_frame, end_frame).
+    // Scans bitmap bytes and skips fully allocated bytes.
+    fn find_free_frame_in_range(
+        &self,
+        start_frame: u64,
+        end_frame: u64,
     ) -> Result<Option<u64>, PmmError> {
-        if self.free_frames == 0 {
+        if start_frame >= end_frame {
             return Ok(None);
         }
 
-        let mut frame_index = 0u64;
+        let mut byte_index_u64 = start_frame / 8;
 
-        while frame_index < self.total_frames {
-            let byte_index_u64 = frame_index / 8;
+        let end_byte = end_frame
+            .checked_add(7)
+            .ok_or(PmmError::ArithmeticOverflow)?
+            / 8;
 
+        while byte_index_u64 < end_byte {
             let byte_index = usize::try_from(byte_index_u64)
                 .map_err(|_| PmmError::ArithmeticOverflow)?;
 
@@ -616,35 +626,127 @@ impl PmmAllocator {
                 return Err(PmmError::InvalidBitmapLayout);
             }
 
-            let bit_index = (frame_index % 8) as u8;
-            let bit_mask = 1u8 << bit_index;
-
             let current = unsafe {
                 self.bitmap.add(byte_index).read()
             };
 
-            if current & bit_mask == 0 {
-                let physical_address =
-                    self.frame_index_to_physical(frame_index)?;
+            // Entirely allocated bytes cannot contain a free frame.
+            if current != 0xFF {
+                let byte_start = byte_index_u64
+                    .checked_mul(8)
+                    .ok_or(PmmError::ArithmeticOverflow)?;
 
-                unsafe {
-                    self.bitmap.add(byte_index)
-                        .write(current | bit_mask);
+                let range_start = start_frame.max(byte_start);
+                let range_end = end_frame.min(
+                    byte_start
+                        .checked_add(8)
+                        .ok_or(PmmError::ArithmeticOverflow)?
+                );
+
+                let first_bit = (range_start - byte_start) as u32;
+                let end_bit = (range_end - byte_start) as u32;
+
+                let lower_mask = (1u16 << first_bit) - 1;
+                let upper_mask = (1u16 << end_bit) - 1;
+
+                let valid_mask = (upper_mask & !lower_mask) as u8;
+
+                let free_bits = !current & valid_mask;
+
+                if free_bits != 0 {
+                    let bit_index = free_bits.trailing_zeros() as u64;
+
+                    let frame_index = byte_start
+                        .checked_add(bit_index)
+                        .ok_or(PmmError::ArithmeticOverflow)?;
+
+                    return Ok(Some(frame_index));
                 }
-
-                self.free_frames = self.free_frames
-                    .checked_sub(1)
-                    .ok_or(PmmError::BitmapValidationFailed)?;
-
-                return Ok(Some(physical_address));
             }
 
-            frame_index += 1;
+            byte_index_u64 += 1;
         }
 
-        Err(PmmError::BitmapValidationFailed)
+        Ok(None)
     }
 
+    pub fn allocate_frame(
+        &mut self,
+    ) -> Result<Option<u64>, PmmError> {
+        if self.free_frames == 0 {
+            return Ok(None);
+        }
+
+        if self.total_frames == 0
+            || self.next_fit_frame >= self.total_frames
+        {
+            return Err(PmmError::InvalidBitmapLayout);
+        }
+
+        // First search: cursor to the end of the bitmap.
+        let mut found = self.find_free_frame_in_range(
+            self.next_fit_frame,
+            self.total_frames,
+        )?;
+
+        // Second search: wrap around to the beginning.
+        if found.is_none() && self.next_fit_frame != 0 {
+            found = self.find_free_frame_in_range(
+                0,
+                self.next_fit_frame,
+            )?;
+        }
+
+        let frame_index =
+            found.ok_or(PmmError::BitmapValidationFailed)?;
+
+        let byte_index = usize::try_from(frame_index / 8)
+            .map_err(|_| PmmError::ArithmeticOverflow)?;
+
+        if byte_index >= self.bitmap_len {
+            return Err(PmmError::InvalidBitmapLayout);
+        }
+
+        let bit_mask = 1u8 << (frame_index % 8);
+
+        let current = unsafe {
+            self.bitmap.add(byte_index).read()
+        };
+
+        // Defensive check before modifying the bitmap.
+        if current & bit_mask != 0 {
+            return Err(PmmError::BitmapValidationFailed);
+        }
+
+        let physical_address =
+            self.frame_index_to_physical(frame_index)?;
+
+        let remaining_free = self.free_frames
+            .checked_sub(1)
+            .ok_or(PmmError::BitmapValidationFailed)?;
+
+        unsafe {
+            self.bitmap.add(byte_index)
+                .write(current | bit_mask);
+        }
+
+        self.free_frames = remaining_free;
+
+        // Advance the cursor, wrapping at the bitmap end.
+        self.next_fit_frame = if frame_index + 1 >= self.total_frames {
+            0
+        } else {
+            frame_index + 1
+        };
+
+        Ok(Some(physical_address))
+    }
+
+pub fn next_fit_cursor(&self) -> u64 {
+    self.next_fit_frame
+}
+
+    
    pub fn free_frame(
     &mut self,
     physical_address: u64,
@@ -763,4 +865,44 @@ impl PmmAllocator {
     pub fn reserved_low_memory_frames(&self) -> u64 {
         self.reserved_low_memory_frames
     }
+}
+
+
+
+pub fn validate_next_fit_wraparound() -> bool {
+    // 16 simulated frames.
+    // Only frame index 2 is free.
+    let mut bitmap = [0xFBu8, 0xFFu8];
+
+    let mut regions = [UsableRegion::EMPTY; MAX_USABLE_REGIONS];
+
+    regions[0] = UsableRegion {
+        physical_start: 0x0010_0000,
+        frame_count: 16,
+        first_frame_index: 0,
+    };
+
+    let mut allocator = PmmAllocator {
+        bitmap: bitmap.as_mut_ptr(),
+        bitmap_len: bitmap.len(),
+        next_fit_frame: 12,
+        bitmap_physical_start: 0x0080_0000,
+        bitmap_pages: 1,
+        total_frames: 16,
+        free_frames: 1,
+        regions,
+        region_count: 1,
+        reserved_low_memory_frames: 0,
+    };
+
+    let allocated = allocator.allocate_frame();
+
+    matches!(
+        allocated,
+        Ok(Some(0x0010_2000))
+    )
+        && allocator.next_fit_cursor() == 3
+        && allocator.free_frames() == 0
+        && bitmap[0] == 0xFF
+        && bitmap[1] == 0xFF
 }

@@ -1437,6 +1437,26 @@ match pmm::discover_usable_layout() {
                     stats,
                 ) {
                     Ok(mut allocator) => {
+
+                        // Stage 4.7: Validate next-fit wraparound.
+                        serial_write(
+                            "[PMM] Testing next-fit wraparound...\r\n"
+                        );
+
+                        if !pmm::validate_next_fit_wraparound() {
+                            serial_write(
+                                "[PMM] Next-fit wraparound FAILED.\r\n"
+                            );
+
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        serial_write(
+                            "[PMM] Next-fit wraparound PASSED.\r\n"
+                        );
+                        
                         serial_write("[PMM] Low-memory frames reserved: ");
                         serial_write_u64(
                             allocator.reserved_low_memory_frames()
@@ -1448,6 +1468,8 @@ match pmm::discover_usable_layout() {
                         serial_write("\r\n");
 
                         let initial_free = allocator.free_frames();
+
+                        let initial_cursor = allocator.next_fit_cursor();
 
                         let frame_one = match allocator.allocate_frame() {
                             Ok(Some(address)) => address,
@@ -1627,14 +1649,17 @@ match pmm::discover_usable_layout() {
                             }
                         };
 
-                        if reallocated_frame != frame_two {
-                            serial_write("[PMM] Freed-frame reuse FAILED.\r\n");
-                            loop {
-                                core::hint::spin_loop();
-                            }
-                        }
+                       if reallocated_frame == frame_two
+    || allocator.next_fit_cursor() == initial_cursor
+{
+    serial_write("[PMM] Next-fit cursor validation FAILED.\r\n");
 
-                        serial_write("[PMM] Freed-frame reuse PASSED.\r\n");
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+serial_write("[PMM] Next-fit cursor advancement PASSED.\r\n");
 
                         // 8. Release all three test allocations.
                         if allocator.free_frame(frame_one).is_err()

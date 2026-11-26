@@ -4,6 +4,7 @@
 
 mod limine;
 mod pmm;
+mod vmm;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
@@ -1128,6 +1129,16 @@ pub extern "C" fn _start() -> ! {
     serial_init();
 
     serial_write("\r\n[BOOT] Asternel kernel started.\r\n");
+
+    // Stage 5.1: Validate virtual-address and page-table foundations.
+    serial_write("[VMM] Validating virtual memory foundations...\r\n");
+    if !vmm::validate_foundations() {
+        serial_write("[VMM] Foundation validation FAILED.\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    serial_write("[VMM] Foundation validation PASSED.\r\n");
 
 
         if !inspect_ia32_pat() {

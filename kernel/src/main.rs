@@ -3,6 +3,7 @@
 #![no_main]
 
 mod limine;
+mod pmm;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
@@ -1185,9 +1186,9 @@ if !inspect_mtrr_resolution() {
     }
 }
 
-
-
-
+    
+    
+    
     // Executable-file response
    serial_write("[KERNEL] Checking executable-address response...\r\n");
 
@@ -1251,7 +1252,7 @@ limine::KernelReservationError::VirtualBaseMismatch =>
     }
 }
 
-
+    
 
     // HHDM response
     serial_write("[HHDM] Checking Higher Half Direct Map...\r\n");
@@ -1356,6 +1357,424 @@ limine::KernelReservationError::VirtualBaseMismatch =>
         }
     }
 
+
+serial_write("[PMM] Inspecting usable physical frames...\r\n");
+
+
+serial_write("[PMM] Discovering usable memory layout...\r\n");
+
+
+match pmm::discover_usable_layout() {
+    Ok(layout) => {
+        serial_write("[PMM] Usable regions: ");
+        serial_write_u64(layout.region_count as u64);
+        serial_write("\r\n");
+
+        serial_write("[PMM] Total usable frames: ");
+        serial_write_u64(layout.total_frames);
+        serial_write("\r\n");
+
+        serial_write("[PMM] Kernel reservation: ");
+        serial_write_u64(layout.kernel_start);
+        serial_write(" - ");
+        serial_write_u64(layout.kernel_end);
+        serial_write("\r\n");
+
+        serial_write("[PMM] Bootloader-reclaimable bytes: ");
+        serial_write_u64(layout.bootloader_reclaimable_bytes);
+        serial_write("\r\n");
+
+        serial_write("[PMM] Bootloader-reclaimable regions: ");
+        serial_write_u64(layout.bootloader_reclaimable_regions);
+        serial_write("\r\n");
+
+        serial_write("[PMM] Bitmap physical start: ");
+        serial_write_u64(layout.bitmap_physical_start);
+        serial_write("\r\n");
+
+        serial_write("[PMM] Bitmap backing region: ");
+        serial_write_u64(layout.bitmap_region_index as u64);
+        serial_write("\r\n");
+
+        serial_write("[PMM] Bitmap size: ");
+        serial_write_u64(layout.bitmap_bytes);
+        serial_write(" bytes\r\n");
+
+        serial_write("[PMM] Bitmap pages reserved: ");
+        serial_write_u64(layout.bitmap_pages);
+        serial_write("\r\n");
+
+        serial_write("[PMM] Planned allocatable frames: ");
+        serial_write_u64(layout.planned_allocatable_frames);
+        serial_write("\r\n");
+
+        serial_write("[PMM] Reservation planning PASSED.\r\n");
+
+        // Stage 4.4: Initialize the physical memory bitmap.
+        serial_write("[PMM] Initializing physical memory bitmap...\r\n");
+
+        match pmm::initialize_bitmap(&layout) {
+            Ok(stats) => {
+                serial_write("[PMM] Bitmap virtual address: ");
+                serial_write_u64(stats.virtual_address);
+                serial_write("\r\n");
+
+                serial_write("[PMM] Bitmap free frames: ");
+                serial_write_u64(stats.free_frames);
+                serial_write("\r\n");
+
+                serial_write("[PMM] Bitmap reserved frames: ");
+                serial_write_u64(stats.reserved_frames);
+                serial_write("\r\n");
+
+                serial_write("[PMM] Bitmap initialization PASSED.\r\n");
+
+                // Stage 4.5: Create the physical frame allocator.
+                serial_write("[PMM] Creating physical frame allocator...\r\n");
+
+                match pmm::PmmAllocator::from_initialized_layout(
+                    &layout,
+                    stats,
+                ) {
+                    Ok(mut allocator) => {
+                        serial_write("[PMM] Low-memory frames reserved: ");
+                        serial_write_u64(
+                            allocator.reserved_low_memory_frames()
+                        );
+                        serial_write("\r\n");
+
+                        serial_write("[PMM] Allocatable frames: ");
+                        serial_write_u64(allocator.free_frames());
+                        serial_write("\r\n");
+
+                        let initial_free = allocator.free_frames();
+
+                        let frame_one = match allocator.allocate_frame() {
+                            Ok(Some(address)) => address,
+                            _ => {
+                                serial_write("[PMM] First allocation FAILED.\r\n");
+                                loop {
+                                    core::hint::spin_loop();
+                                }
+                            }
+                        };
+
+                        let frame_two = match allocator.allocate_frame() {
+                            Ok(Some(address)) => address,
+                            _ => {
+                                serial_write("[PMM] Second allocation FAILED.\r\n");
+                                loop {
+                                    core::hint::spin_loop();
+                                }
+                            }
+                        };
+
+                        let frame_three = match allocator.allocate_frame() {
+                            Ok(Some(address)) => address,
+                            _ => {
+                                serial_write("[PMM] Third allocation FAILED.\r\n");
+                                loop {
+                                    core::hint::spin_loop();
+                                }
+                            }
+                        };
+
+                        let aligned =
+                            frame_one % limine::PAGE_SIZE == 0
+                            && frame_two % limine::PAGE_SIZE == 0
+                            && frame_three % limine::PAGE_SIZE == 0;
+
+                        let unique =
+                            frame_one != frame_two
+                            && frame_one != frame_three
+                            && frame_two != frame_three;
+
+                        let accounting_valid =
+                            initial_free.checked_sub(3)
+                                == Some(allocator.free_frames());
+
+                        serial_write("[PMM] Allocated frame 1: ");
+                        serial_write_u64(frame_one);
+                        serial_write("\r\n");
+
+                        serial_write("[PMM] Allocated frame 2: ");
+                        serial_write_u64(frame_two);
+                        serial_write("\r\n");
+
+                        serial_write("[PMM] Allocated frame 3: ");
+                        serial_write_u64(frame_three);
+                        serial_write("\r\n");
+
+                        if !aligned || !unique || !accounting_valid {
+                            serial_write("[PMM] Allocation validation FAILED.\r\n");
+
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        serial_write("[PMM] Frame alignment PASSED.\r\n");
+                        serial_write("[PMM] Frame uniqueness PASSED.\r\n");
+                        serial_write("[PMM] Free-frame accounting PASSED.\r\n");
+                        serial_write("[PMM] Physical frame allocation PASSED.\r\n");
+
+
+                                                // Stage 4.6: Physical frame deallocation.
+
+                        serial_write("[PMM] Testing physical frame deallocation...\r\n");
+
+                        // 1. Free the second allocated frame.
+                        if allocator.free_frame(frame_two).is_err() {
+                            serial_write("[PMM] Frame deallocation FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        if allocator.free_frames() != initial_free - 2 {
+                            serial_write("[PMM] Deallocation accounting FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        serial_write("[PMM] Frame deallocation PASSED.\r\n");
+
+                        // 2. Reject double free.
+                        if !matches!(
+                            allocator.free_frame(frame_two),
+                            Err(pmm::PmmError::FrameAlreadyFree)
+                        ) {
+                            serial_write("[PMM] Double-free rejection FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        serial_write("[PMM] Double-free rejection PASSED.\r\n");
+
+                        // 3. Reject unaligned physical addresses.
+                        if !matches!(
+                            allocator.free_frame(frame_two + 1),
+                            Err(pmm::PmmError::InvalidFrameAddress)
+                        ) {
+                            serial_write("[PMM] Unaligned-address rejection FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        serial_write("[PMM] Unaligned-address rejection PASSED.\r\n");
+
+                        // 4. Reject addresses outside usable regions.
+                        let invalid_address = u64::MAX
+                            & !(limine::PAGE_SIZE - 1);
+
+                        if !matches!(
+                            allocator.free_frame(invalid_address),
+                            Err(pmm::PmmError::FrameNotUsable)
+                        ) {
+                            serial_write("[PMM] Non-usable-frame rejection FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        serial_write("[PMM] Non-usable-frame rejection PASSED.\r\n");
+
+                        // 5. Protect low-memory reservations.
+                        if !matches!(
+                            allocator.free_frame(0),
+                            Err(pmm::PmmError::ReservedFrame)
+                        ) {
+                            serial_write("[PMM] Low-memory reservation protection FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        serial_write("[PMM] Low-memory reservation protection PASSED.\r\n");
+
+                        // 6. Protect bitmap storage.
+                        if !matches!(
+                            allocator.free_frame(layout.bitmap_physical_start),
+                            Err(pmm::PmmError::ReservedFrame)
+                        ) {
+                            serial_write("[PMM] Bitmap reservation protection FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        serial_write("[PMM] Bitmap reservation protection PASSED.\r\n");
+
+                        // Invalid free attempts must not change accounting.
+                        if allocator.free_frames() != initial_free - 2 {
+                            serial_write("[PMM] Invalid-free accounting FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        // 7. Allocate again; the freed frame should be reused.
+                        let reallocated_frame = match allocator.allocate_frame() {
+                            Ok(Some(address)) => address,
+                            _ => {
+                                serial_write("[PMM] Frame reallocation FAILED.\r\n");
+                                loop {
+                                    core::hint::spin_loop();
+                                }
+                            }
+                        };
+
+                        if reallocated_frame != frame_two {
+                            serial_write("[PMM] Freed-frame reuse FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        serial_write("[PMM] Freed-frame reuse PASSED.\r\n");
+
+                        // 8. Release all three test allocations.
+                        if allocator.free_frame(frame_one).is_err()
+                            || allocator.free_frame(reallocated_frame).is_err()
+                            || allocator.free_frame(frame_three).is_err()
+                        {
+                            serial_write("[PMM] Final frame cleanup FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        // All frames must be returned.
+                        if allocator.free_frames() != initial_free {
+                            serial_write("[PMM] Final free-frame accounting FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        if allocator.free_frames() > allocator.total_frames() {
+                            serial_write("[PMM] Total-frame validation FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        serial_write("[PMM] Final free-frame accounting PASSED.\r\n");
+                        serial_write("[PMM] Physical frame deallocation PASSED.\r\n");
+                    }
+
+                    Err(_) => {
+                        serial_write("[PMM] Allocator initialization FAILED.\r\n");
+
+                        loop {
+                            core::hint::spin_loop();
+                        }
+                    }
+                }
+            }
+
+            Err(error) => {
+                serial_write("[PMM] Bitmap initialization FAILED: ");
+
+                match error {
+                    pmm::PmmError::MissingMemoryMap =>
+                        serial_write("Missing memory map.\r\n"),
+
+                    pmm::PmmError::InvalidMemoryMap =>
+                        serial_write("Invalid memory map.\r\n"),
+
+                    pmm::PmmError::ArithmeticOverflow =>
+                        serial_write("Arithmetic overflow.\r\n"),
+
+                    pmm::PmmError::NoUsableFrames =>
+                        serial_write("No usable frames.\r\n"),
+
+                    pmm::PmmError::TooManyRegions =>
+                        serial_write("Too many usable regions.\r\n"),
+
+                    pmm::PmmError::MissingKernelReservation =>
+                        serial_write("Missing kernel reservation.\r\n"),
+
+                    pmm::PmmError::KernelOverlapsUsableMemory =>
+                        serial_write("Kernel overlaps usable memory.\r\n"),
+
+                    pmm::PmmError::NoBitmapBackingRegion =>
+                        serial_write("No bitmap backing region.\r\n"),
+
+                    pmm::PmmError::BitmapBackingNotMapped =>
+                        serial_write("Bitmap backing is not mapped.\r\n"),
+
+                    pmm::PmmError::InvalidBitmapLayout =>
+                        serial_write("Invalid bitmap layout.\r\n"),
+
+                    pmm::PmmError::BitmapValidationFailed =>
+                        serial_write("Bitmap validation failed.\r\n"),
+
+                    _ => {
+    serial_write("[PMM] Unexpected PMM error.\r\n");
+}
+                }
+
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
+
+    Err(error) => {
+        serial_write("[PMM] Layout discovery FAILED: ");
+
+        match error {
+            pmm::PmmError::MissingMemoryMap =>
+                serial_write("Missing memory map.\r\n"),
+
+            pmm::PmmError::InvalidMemoryMap =>
+                serial_write("Invalid memory map.\r\n"),
+
+            pmm::PmmError::ArithmeticOverflow =>
+                serial_write("Arithmetic overflow.\r\n"),
+
+            pmm::PmmError::NoUsableFrames =>
+                serial_write("No usable frames.\r\n"),
+
+            pmm::PmmError::TooManyRegions =>
+                serial_write("Too many usable regions.\r\n"),
+
+            pmm::PmmError::MissingKernelReservation =>
+                serial_write("Missing kernel reservation.\r\n"),
+
+            pmm::PmmError::KernelOverlapsUsableMemory =>
+                serial_write("Kernel overlaps usable memory.\r\n"),
+
+            pmm::PmmError::NoBitmapBackingRegion =>
+                serial_write("No bitmap backing region.\r\n"),
+
+            pmm::PmmError::BitmapBackingNotMapped =>
+                serial_write("Bitmap backing is not mapped.\r\n"),
+
+            pmm::PmmError::InvalidBitmapLayout =>
+                serial_write("Invalid bitmap layout.\r\n"),
+
+            pmm::PmmError::BitmapValidationFailed =>
+                serial_write("Bitmap validation failed.\r\n"),
+        
+        _ => {
+    serial_write("[PMM] Unexpected PMM error.\r\n");
+}
+        }
+
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+
+    
     // Read-only paging mode discovery
     serial_write("[MM] Checking active paging mode...\r\n");
 
@@ -1399,10 +1818,10 @@ limine::KernelReservationError::VirtualBaseMismatch =>
         }
     }
 
-
-
+    
+    
     // Read-only active page-table root discovery
-
+   
     // Read-only active page-table root discovery and validation
     serial_write("[MM] Validating active CR3 register...\r\n");
 
@@ -1541,7 +1960,7 @@ limine::KernelReservationError::VirtualBaseMismatch =>
     // Read-only PML4 inspection
     serial_write("[MM] Inspecting PML4 root entries...\r\n");
 
-
+   
     match limine::physical_to_virtual(root_page) {
         Some(_) => {
            let pml4_virtual = match limine::physical_range_to_virtual(
@@ -1560,7 +1979,7 @@ limine::KernelReservationError::VirtualBaseMismatch =>
 let pml4 = pml4_virtual as *const u64;
 serial_write("[MM] PML4 HHDM range validation PASSED.\r\n");
 
-
+            
             let mut present_count = 0u64;
             let mut index = 0usize;
 
@@ -1583,7 +2002,7 @@ serial_write("[MM] PML4 HHDM range validation PASSED.\r\n");
             serial_write("[MM] PML4 root inspection completed.\r\n");
 
             // Inspect present entries without dereferencing child tables.
-
+           
             // Validate present PML4 entries without dereferencing children.
             serial_write("[MM] Validating present PML4 entries...\r\n");
 
@@ -1711,7 +2130,7 @@ serial_write("[MM] PML4 HHDM range validation PASSED.\r\n");
 
 let mut pdpt_count = 0u64;
 let mut pml4_index = 0usize;
-
+            
  let mut leaf_entries = 0u64;
 let mut writable_entries = 0u64;
 let mut user_entries = 0u64;
@@ -1720,7 +2139,7 @@ let mut nx_entries = 0u64;
 let mut validated_1g = 0u64;
 let mut validated_2m = 0u64;
 let mut validated_4k = 0u64;
-
+            
 while pml4_index < 512 {
     let pml4_entry =
         unsafe { core::ptr::read_volatile(pml4.add(pml4_index)) };
@@ -1730,7 +2149,7 @@ while pml4_index < 512 {
 let pml4_writable = (pml4_entry & (1 << 1)) != 0;
 let pml4_user = (pml4_entry & (1 << 2)) != 0;
 let pml4_nx = (pml4_entry & (1u64 << 63)) != 0;
-
+        
         let child_physical =
             pml4_entry & 0x000F_FFFF_FFFF_F000;
 
@@ -1871,7 +2290,7 @@ if effective_nx {
     nx_entries += 1;
 }
 
-
+            
             let physical_base =
                 address_bits & !((1u64 << 30) - 1);
 
@@ -1890,7 +2309,7 @@ if effective_nx {
 
 validated_1g += 1;
 
-
+            
 
             serial_write("[MM] Mapping type: 1 GiB HUGE PAGE\r\n");
             serial_write("[MM] Physical base: ");
@@ -2040,7 +2459,7 @@ if !validate_leaf_physical_range(
 
 validated_2m += 1;
 
-
+                                
                                huge_pages += 1;
 
 leaf_entries += 1;
@@ -2056,7 +2475,7 @@ if pde_user {
 if pde_nx {
     nx_entries += 1;
 }
-
+                                
                             } else {
                                 // Pointer to a page table.
                                 let table_physical =
@@ -2121,7 +2540,7 @@ if pte_user {
 if pte_nx {
     nx_entries += 1;
 }
-
+                
 
                 let nx = (entry >> 63) & 1;
 
@@ -2134,7 +2553,7 @@ if (entry & (1u64 << 7)) != 0 && !supports_pat() {
         core::hint::spin_loop();
     }
 }
-
+                
                 let address_bits =
                     entry & 0x000F_FFFF_FFFF_F000;
 
@@ -2176,7 +2595,7 @@ if !validate_leaf_physical_range(
 
 validated_4k += 1;
 
-
+                
             }
 
             table_index += 1;
@@ -2263,7 +2682,7 @@ validated_4k += 1;
 serial_write("[MM] PDPT inspection complete.\r\n");
 serial_write("[MM] PDPT tables inspected: ");
 serial_write_u64(pdpt_count);
-serial_write("\r\n");
+serial_write("\r\n");  
 
 serial_write("[MM] Effective permission analysis:\r\n");
 
@@ -2309,9 +2728,9 @@ serial_write("\r\n");
 
 serial_write("[MM] Physical mapping validation PASSED.\r\n");
 
-
+            
 serial_write("[MM] Effective permission analysis PASSED.\r\n");
-
+            
 
             serial_write(
                 "[MM] Present PML4 entry inspection completed.\r\n"
@@ -2324,8 +2743,8 @@ serial_write("[MM] Effective permission analysis PASSED.\r\n");
     }
 
 
-
-
+    
+    
     // Physical memory statistics
     match limine::calculate_memmap_stats() {
         Ok(stats) => {

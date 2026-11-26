@@ -1438,6 +1438,26 @@ match pmm::discover_usable_layout() {
                 ) {
                     Ok(mut allocator) => {
 
+                        // Stage 4.9: Validate the live PMM metadata and bitmap.
+                        serial_write("[PMM] Validating allocator state...\r\n");
+                        if allocator.validate_state().is_err() {
+                            serial_write("[PMM] Allocator state validation FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+                        serial_write("[PMM] Allocator state validation PASSED.\r\n");
+
+                        // Stage 4.9: Exercise fragmented allocation patterns.
+                        serial_write("[PMM] Testing fragmentation patterns...\r\n");
+                        if !pmm::validate_fragmentation_patterns() {
+                            serial_write("[PMM] Fragmentation validation FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+                        serial_write("[PMM] Fragmentation validation PASSED.\r\n");
+
                         // Stage 4.7: Validate next-fit wraparound.
                         serial_write(
                             "[PMM] Testing next-fit wraparound...\r\n"
@@ -1530,6 +1550,14 @@ match pmm::discover_usable_layout() {
                         serial_write(
                             "[PMM] Runtime contiguous allocation/deallocation PASSED.\r\n"
                         );
+
+                        if allocator.validate_state().is_err() {
+                            serial_write("[PMM] Post-contiguous PMM validation FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+                        serial_write("[PMM] Post-contiguous PMM validation PASSED.\r\n");
 
                         
                         serial_write("[PMM] Low-memory frames reserved: ");
@@ -1763,6 +1791,13 @@ serial_write("[PMM] Next-fit cursor advancement PASSED.\r\n");
                         }
 
                         serial_write("[PMM] Final free-frame accounting PASSED.\r\n");
+                        if allocator.validate_state().is_err() {
+                            serial_write("[PMM] Final allocator-state validation FAILED.\r\n");
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+                        serial_write("[PMM] Final allocator-state validation PASSED.\r\n");
                         serial_write("[PMM] Physical frame deallocation PASSED.\r\n");
                     }
 

@@ -1241,6 +1241,187 @@ impl PmmAllocator {
     Ok(())
 }
     
+    // Recount and validate allocator metadata against the bitmap.
+    // This is an explicit diagnostic; allocation paths do not call it.
+    pub fn validate_state(&self) -> Result<(), PmmError> {
+        if self.bitmap.is_null()
+            || self.total_frames == 0
+            || self.region_count == 0
+            || self.region_count > MAX_USABLE_REGIONS
+            || self.bitmap_pages == 0
+            || self.bitmap_pages > self.total_frames
+            || self.bitmap_physical_start % limine::PAGE_SIZE != 0
+            || self.next_fit_frame >= self.total_frames
+            || self.free_frames > self.total_frames
+        {
+            return Err(PmmError::InvalidBitmapLayout);
+        }
+
+        let expected_bitmap_len = self.total_frames
+            .checked_add(7)
+            .ok_or(PmmError::ArithmeticOverflow)?
+            / 8;
+
+        if usize::try_from(expected_bitmap_len)
+            .map_err(|_| PmmError::ArithmeticOverflow)? != self.bitmap_len
+        {
+            return Err(PmmError::InvalidBitmapLayout);
+        }
+
+        let mut expected_first_frame = 0u64;
+        let mut region_index = 0usize;
+
+        while region_index < self.region_count {
+            let region = self.regions[region_index];
+
+            if region.frame_count == 0
+                || region.physical_start % limine::PAGE_SIZE != 0
+                || region.first_frame_index != expected_first_frame
+            {
+                return Err(PmmError::InvalidBitmapLayout);
+            }
+
+            let region_bytes = region.frame_count
+                .checked_mul(limine::PAGE_SIZE)
+                .ok_or(PmmError::ArithmeticOverflow)?;
+            let region_end = region.physical_start
+                .checked_add(region_bytes)
+                .ok_or(PmmError::ArithmeticOverflow)?;
+
+            let mut other_index = region_index + 1;
+            while other_index < self.region_count {
+                let other = self.regions[other_index];
+                let other_bytes = other.frame_count
+                    .checked_mul(limine::PAGE_SIZE)
+                    .ok_or(PmmError::ArithmeticOverflow)?;
+                let other_end = other.physical_start
+                    .checked_add(other_bytes)
+                    .ok_or(PmmError::ArithmeticOverflow)?;
+
+                if region.physical_start < other_end
+                    && other.physical_start < region_end
+                {
+                    return Err(PmmError::InvalidBitmapLayout);
+                }
+
+                other_index += 1;
+            }
+
+            expected_first_frame = expected_first_frame
+                .checked_add(region.frame_count)
+                .ok_or(PmmError::ArithmeticOverflow)?;
+            region_index += 1;
+        }
+
+        if expected_first_frame != self.total_frames {
+            return Err(PmmError::InvalidBitmapLayout);
+        }
+
+        let remainder = (self.total_frames % 8) as u8;
+        if remainder != 0 {
+            let last_byte = unsafe {
+                self.bitmap.add(self.bitmap_len - 1).read()
+            };
+            let unused_mask = !((1u8 << remainder) - 1);
+            if last_byte & unused_mask != unused_mask {
+                return Err(PmmError::BitmapValidationFailed);
+            }
+        }
+
+        let bitmap_bytes = self.bitmap_pages
+            .checked_mul(limine::PAGE_SIZE)
+            .ok_or(PmmError::ArithmeticOverflow)?;
+        let bitmap_end = self.bitmap_physical_start
+            .checked_add(bitmap_bytes)
+            .ok_or(PmmError::ArithmeticOverflow)?;
+
+        region_index = 0;
+        while region_index < self.region_count {
+            let region = self.regions[region_index];
+            let region_end = region.physical_start
+                .checked_add(
+                    region.frame_count
+                        .checked_mul(limine::PAGE_SIZE)
+                        .ok_or(PmmError::ArithmeticOverflow)?
+                )
+                .ok_or(PmmError::ArithmeticOverflow)?;
+
+            if self.bitmap_physical_start < region_end
+                && region.physical_start < bitmap_end
+            {
+                if self.bitmap_physical_start < region.physical_start
+                    || bitmap_end > region_end
+                {
+                    return Err(PmmError::InvalidBitmapLayout);
+                }
+
+                let offset = self.bitmap_physical_start
+                    .checked_sub(region.physical_start)
+                    .ok_or(PmmError::InvalidBitmapLayout)?;
+                if offset % limine::PAGE_SIZE != 0 {
+                    return Err(PmmError::InvalidBitmapLayout);
+                }
+
+                let first = region.first_frame_index
+                    .checked_add(offset / limine::PAGE_SIZE)
+                    .ok_or(PmmError::ArithmeticOverflow)?;
+                let mut reserved_offset = 0u64;
+                while reserved_offset < self.bitmap_pages {
+                    let frame_index = first
+                        .checked_add(reserved_offset)
+                        .ok_or(PmmError::ArithmeticOverflow)?;
+                    let byte_index = usize::try_from(frame_index / 8)
+                        .map_err(|_| PmmError::ArithmeticOverflow)?;
+                    if byte_index >= self.bitmap_len {
+                        return Err(PmmError::InvalidBitmapLayout);
+                    }
+                    let mask = 1u8 << (frame_index % 8);
+                    let value = unsafe {
+                        self.bitmap.add(byte_index).read()
+                    };
+                    if value & mask == 0 {
+                        return Err(PmmError::BitmapValidationFailed);
+                    }
+                    reserved_offset += 1;
+                }
+            }
+            region_index += 1;
+        }
+
+        let mut counted_free = 0u64;
+        let mut frame_index = 0u64;
+        while frame_index < self.total_frames {
+            let physical_address = self.frame_index_to_physical(frame_index)?;
+            let byte_index = usize::try_from(frame_index / 8)
+                .map_err(|_| PmmError::ArithmeticOverflow)?;
+            let mask = 1u8 << (frame_index % 8);
+            let value = unsafe {
+                self.bitmap.add(byte_index).read()
+            };
+            let is_free = value & mask == 0;
+
+            if is_free {
+                if physical_address < 0x0010_0000
+                    || (physical_address >= self.bitmap_physical_start
+                        && physical_address < bitmap_end)
+                {
+                    return Err(PmmError::BitmapValidationFailed);
+                }
+                counted_free = counted_free
+                    .checked_add(1)
+                    .ok_or(PmmError::ArithmeticOverflow)?;
+            }
+
+            frame_index += 1;
+        }
+
+        if counted_free != self.free_frames {
+            return Err(PmmError::BitmapValidationFailed);
+        }
+
+        Ok(())
+    }
+
     pub fn free_frames(&self) -> u64 {
         self.free_frames
     }
@@ -1254,6 +1435,102 @@ impl PmmAllocator {
     }
 }
 
+
+
+pub fn validate_fragmentation_patterns() -> bool {
+    // Alternating allocated/free frames create many free frames but no
+    // two-frame contiguous run.
+    let mut bitmap = [0xAAu8, 0xAAu8];
+    let mut regions = [UsableRegion::EMPTY; MAX_USABLE_REGIONS];
+    regions[0] = UsableRegion {
+        physical_start: 0x0010_0000,
+        frame_count: 16,
+        first_frame_index: 0,
+    };
+
+    let mut allocator = PmmAllocator {
+        bitmap: bitmap.as_mut_ptr(),
+        bitmap_len: bitmap.len(),
+        next_fit_frame: 0,
+        bitmap_physical_start: 0x0080_0000,
+        bitmap_pages: 1,
+        total_frames: 16,
+        free_frames: 8,
+        regions,
+        region_count: 1,
+        reserved_low_memory_frames: 0,
+    };
+
+    if allocator.validate_state().is_err() {
+        return false;
+    }
+
+    // A deliberately incorrect free-frame counter must be detected.
+    allocator.free_frames = 7;
+    if allocator.validate_state().is_ok() {
+        return false;
+    }
+    allocator.free_frames = 8;
+
+    if !matches!(allocator.allocate_contiguous(2, 1), Ok(None))
+        || allocator.free_frames() != 8
+        || allocator.validate_state().is_err()
+    {
+        return false;
+    }
+
+    let first = match allocator.allocate_frame() {
+        Ok(Some(address)) => address,
+        _ => return false,
+    };
+    let second = match allocator.allocate_frame() {
+        Ok(Some(address)) => address,
+        _ => return false,
+    };
+    let third = match allocator.allocate_frame() {
+        Ok(Some(address)) => address,
+        _ => return false,
+    };
+
+    if first != 0x0010_0000
+        || second != 0x0010_2000
+        || third != 0x0010_4000
+        || allocator.free_frames() != 5
+        || allocator.validate_state().is_err()
+    {
+        return false;
+    }
+
+    // Free frames 0, 1, and 2 to create a run across the fragmented bitmap.
+    if allocator.free_frame(first).is_err()
+        || allocator.free_frame(0x0010_1000).is_err()
+        || allocator.free_frame(second).is_err()
+        || allocator.validate_state().is_err()
+    {
+        return false;
+    }
+
+    let recovered_run = match allocator.allocate_contiguous(3, 1) {
+        Ok(Some(address)) => address,
+        _ => return false,
+    };
+
+    if recovered_run != 0x0010_0000
+        || allocator.free_frames() != 5
+        || allocator.validate_state().is_err()
+    {
+        return false;
+    }
+
+    if allocator.free_contiguous(recovered_run, 3).is_err()
+        || allocator.free_frames() != 8
+        || allocator.validate_state().is_err()
+    {
+        return false;
+    }
+
+    true
+}
 
 
 pub fn validate_next_fit_wraparound() -> bool {

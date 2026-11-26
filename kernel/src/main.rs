@@ -1456,6 +1456,81 @@ match pmm::discover_usable_layout() {
                         serial_write(
                             "[PMM] Next-fit wraparound PASSED.\r\n"
                         );
+
+                        // Stage 4.8: Validate contiguous physical allocation.
+                        serial_write(
+                            "[PMM] Testing contiguous allocation validation...\r\n"
+                        );
+
+                        if !pmm::validate_contiguous_allocation() {
+                            serial_write(
+                                "[PMM] Contiguous allocation validation FAILED.\r\n"
+                            );
+
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        serial_write(
+                            "[PMM] Contiguous allocation validation PASSED.\r\n"
+                        );
+
+                        let contiguous_initial_free = allocator.free_frames();
+
+                        let contiguous_start =
+                            match allocator.allocate_contiguous(3, 4) {
+                                Ok(Some(address)) => address,
+                                _ => {
+                                    serial_write(
+                                        "[PMM] Runtime contiguous allocation FAILED.\r\n"
+                                    );
+
+                                    loop {
+                                        core::hint::spin_loop();
+                                    }
+                                }
+                            };
+
+                        let contiguous_accounting_valid =
+                            allocator.free_frames()
+                                == contiguous_initial_free - 3;
+
+                        let contiguous_alignment_valid =
+                            (contiguous_start / limine::PAGE_SIZE) % 4 == 0;
+
+                        if !contiguous_accounting_valid
+                            || !contiguous_alignment_valid
+                        {
+                            serial_write(
+                                "[PMM] Runtime contiguous allocation checks FAILED.\r\n"
+                            );
+
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        if allocator.free_contiguous(
+                            contiguous_start,
+                            3,
+                        ).is_err()
+                            || allocator.free_frames()
+                                != contiguous_initial_free
+                        {
+                            serial_write(
+                                "[PMM] Runtime contiguous deallocation FAILED.\r\n"
+                            );
+
+                            loop {
+                                core::hint::spin_loop();
+                            }
+                        }
+
+                        serial_write(
+                            "[PMM] Runtime contiguous allocation/deallocation PASSED.\r\n"
+                        );
+
                         
                         serial_write("[PMM] Low-memory frames reserved: ");
                         serial_write_u64(

@@ -742,7 +742,394 @@ impl PmmAllocator {
         Ok(Some(physical_address))
     }
 
-pub fn next_fit_cursor(&self) -> u64 {
+
+    // Find a physically contiguous free run inside one usable region.
+    // The search bounds constrain the run's starting frame, not its end.
+    fn find_contiguous_in_region(
+        &self,
+        region_index: usize,
+        minimum_start: u64,
+        maximum_start: u64,
+        frame_count: u64,
+        alignment_frames: u64,
+    ) -> Result<Option<u64>, PmmError> {
+        let region = self.regions[region_index];
+
+        let region_end = region.first_frame_index
+            .checked_add(region.frame_count)
+            .ok_or(PmmError::ArithmeticOverflow)?;
+
+        let mut candidate = minimum_start.max(region.first_frame_index);
+        let candidate_limit = maximum_start.min(region_end);
+
+        if candidate >= candidate_limit {
+            return Ok(None);
+        }
+
+        let physical_first_frame =
+            region.physical_start / limine::PAGE_SIZE;
+
+        loop {
+            let candidate_offset = candidate
+                .checked_sub(region.first_frame_index)
+                .ok_or(PmmError::InvalidBitmapLayout)?;
+
+            let physical_candidate = physical_first_frame
+                .checked_add(candidate_offset)
+                .ok_or(PmmError::ArithmeticOverflow)?;
+
+            let remainder = physical_candidate % alignment_frames;
+            if remainder != 0 {
+                let adjustment = alignment_frames - remainder;
+                candidate = candidate
+                    .checked_add(adjustment)
+                    .ok_or(PmmError::ArithmeticOverflow)?;
+            }
+
+            if candidate >= candidate_limit {
+                return Ok(None);
+            }
+
+            let run_end = candidate
+                .checked_add(frame_count)
+                .ok_or(PmmError::ArithmeticOverflow)?;
+
+            if run_end > region_end {
+                return Ok(None);
+            }
+
+            let mut offset = 0u64;
+            let mut occupied_offset = None;
+
+            while offset < frame_count {
+                let frame_index = candidate
+                    .checked_add(offset)
+                    .ok_or(PmmError::ArithmeticOverflow)?;
+
+                let byte_index = usize::try_from(frame_index / 8)
+                    .map_err(|_| PmmError::ArithmeticOverflow)?;
+
+                if byte_index >= self.bitmap_len {
+                    return Err(PmmError::InvalidBitmapLayout);
+                }
+
+                let bit_mask = 1u8 << (frame_index % 8);
+                let value = unsafe {
+                    self.bitmap.add(byte_index).read()
+                };
+
+                if value & bit_mask != 0 {
+                    occupied_offset = Some(offset);
+                    break;
+                }
+
+                offset += 1;
+            }
+
+            match occupied_offset {
+                None => return Ok(Some(candidate)),
+                Some(offset) => {
+                    // Every start position up to this occupied frame would
+                    // include it, so skip those candidates.
+                    candidate = candidate
+                        .checked_add(offset)
+                        .and_then(|value| value.checked_add(1))
+                        .ok_or(PmmError::ArithmeticOverflow)?;
+                }
+            }
+        }
+    }
+
+    fn find_contiguous_in_range(
+        &self,
+        minimum_start: u64,
+        maximum_start: u64,
+        frame_count: u64,
+        alignment_frames: u64,
+    ) -> Result<Option<u64>, PmmError> {
+        let mut region_index = 0usize;
+
+        while region_index < self.region_count {
+            if let Some(frame_index) = self.find_contiguous_in_region(
+                region_index,
+                minimum_start,
+                maximum_start,
+                frame_count,
+                alignment_frames,
+            )? {
+                return Ok(Some(frame_index));
+            }
+
+            region_index += 1;
+        }
+
+        Ok(None)
+    }
+
+    pub fn allocate_contiguous(
+        &mut self,
+        frame_count: u64,
+        alignment_frames: u64,
+    ) -> Result<Option<u64>, PmmError> {
+        if frame_count == 0 || alignment_frames == 0 {
+            return Err(PmmError::InvalidFrameAddress);
+        }
+
+        if self.total_frames == 0
+            || self.next_fit_frame >= self.total_frames
+        {
+            return Err(PmmError::InvalidBitmapLayout);
+        }
+
+        if frame_count > self.free_frames {
+            return Ok(None);
+        }
+
+        let mut found = self.find_contiguous_in_range(
+            self.next_fit_frame,
+            self.total_frames,
+            frame_count,
+            alignment_frames,
+        )?;
+
+        if found.is_none() && self.next_fit_frame != 0 {
+            found = self.find_contiguous_in_range(
+                0,
+                self.next_fit_frame,
+                frame_count,
+                alignment_frames,
+            )?;
+        }
+
+        let first_frame = match found {
+            Some(index) => index,
+            None => return Ok(None),
+        };
+
+        let physical_start =
+            self.frame_index_to_physical(first_frame)?;
+
+        if (physical_start / limine::PAGE_SIZE)
+            % alignment_frames != 0
+        {
+            return Err(PmmError::InvalidBitmapLayout);
+        }
+
+        let new_free_frames = self.free_frames
+            .checked_sub(frame_count)
+            .ok_or(PmmError::BitmapValidationFailed)?;
+
+        let run_end = first_frame
+            .checked_add(frame_count)
+            .ok_or(PmmError::ArithmeticOverflow)?;
+
+        // Validate the complete run before changing any bitmap bits.
+        let mut offset = 0u64;
+        while offset < frame_count {
+            let frame_index = first_frame
+                .checked_add(offset)
+                .ok_or(PmmError::ArithmeticOverflow)?;
+
+            let byte_index = usize::try_from(frame_index / 8)
+                .map_err(|_| PmmError::ArithmeticOverflow)?;
+
+            if byte_index >= self.bitmap_len {
+                return Err(PmmError::InvalidBitmapLayout);
+            }
+
+            let bit_mask = 1u8 << (frame_index % 8);
+            let value = unsafe {
+                self.bitmap.add(byte_index).read()
+            };
+
+            if value & bit_mask != 0 {
+                return Err(PmmError::BitmapValidationFailed);
+            }
+
+            offset += 1;
+        }
+
+        // Mark every frame allocated.
+        offset = 0;
+        while offset < frame_count {
+            let frame_index = first_frame + offset;
+            let byte_index = (frame_index / 8) as usize;
+            let bit_mask = 1u8 << (frame_index % 8);
+
+            let value = unsafe {
+                self.bitmap.add(byte_index).read()
+            };
+
+            unsafe {
+                self.bitmap.add(byte_index)
+                    .write(value | bit_mask);
+            }
+
+            offset += 1;
+        }
+
+        self.free_frames = new_free_frames;
+        self.next_fit_frame = if run_end >= self.total_frames {
+            0
+        } else {
+            run_end
+        };
+
+        Ok(Some(physical_start))
+    }
+
+    pub fn free_contiguous(
+        &mut self,
+        physical_start: u64,
+        frame_count: u64,
+    ) -> Result<(), PmmError> {
+        if frame_count == 0
+            || physical_start % limine::PAGE_SIZE != 0
+        {
+            return Err(PmmError::InvalidFrameAddress);
+        }
+
+        let range_bytes = frame_count
+            .checked_mul(limine::PAGE_SIZE)
+            .ok_or(PmmError::ArithmeticOverflow)?;
+
+        let physical_end = physical_start
+            .checked_add(range_bytes)
+            .ok_or(PmmError::ArithmeticOverflow)?;
+
+        // Protect low memory.
+        if physical_start < 0x0010_0000 {
+            return Err(PmmError::ReservedFrame);
+        }
+
+        // Protect the bitmap's physical backing pages.
+        let bitmap_bytes = self.bitmap_pages
+            .checked_mul(limine::PAGE_SIZE)
+            .ok_or(PmmError::ArithmeticOverflow)?;
+
+        let bitmap_end = self.bitmap_physical_start
+            .checked_add(bitmap_bytes)
+            .ok_or(PmmError::ArithmeticOverflow)?;
+
+        if physical_start < bitmap_end
+            && self.bitmap_physical_start < physical_end
+        {
+            return Err(PmmError::ReservedFrame);
+        }
+
+        // The entire range must belong to one usable region. This prevents
+        // treating adjacent bitmap indices from separate regions as one run.
+        let mut first_frame_index = None;
+        let mut region_index = 0usize;
+
+        while region_index < self.region_count {
+            let region = self.regions[region_index];
+
+            let region_bytes = region.frame_count
+                .checked_mul(limine::PAGE_SIZE)
+                .ok_or(PmmError::ArithmeticOverflow)?;
+
+            let region_end = region.physical_start
+                .checked_add(region_bytes)
+                .ok_or(PmmError::ArithmeticOverflow)?;
+
+            if physical_start >= region.physical_start
+                && physical_end <= region_end
+            {
+                let byte_offset = physical_start
+                    .checked_sub(region.physical_start)
+                    .ok_or(PmmError::InvalidFrameAddress)?;
+
+                if byte_offset % limine::PAGE_SIZE != 0 {
+                    return Err(PmmError::InvalidFrameAddress);
+                }
+
+                let frame_offset = byte_offset / limine::PAGE_SIZE;
+
+                first_frame_index = Some(
+                    region.first_frame_index
+                        .checked_add(frame_offset)
+                        .ok_or(PmmError::ArithmeticOverflow)?
+                );
+
+                break;
+            }
+
+            region_index += 1;
+        }
+
+        let first_frame = first_frame_index
+            .ok_or(PmmError::FrameNotUsable)?;
+
+        let run_end = first_frame
+            .checked_add(frame_count)
+            .ok_or(PmmError::ArithmeticOverflow)?;
+
+        if run_end > self.total_frames {
+            return Err(PmmError::FrameNotUsable);
+        }
+
+        // Validate every bit first, so double-free and partially-free
+        // ranges are reported accurately before accounting checks.
+        let mut offset = 0u64;
+        while offset < frame_count {
+            let frame_index = first_frame
+                .checked_add(offset)
+                .ok_or(PmmError::ArithmeticOverflow)?;
+
+            let byte_index = usize::try_from(frame_index / 8)
+                .map_err(|_| PmmError::ArithmeticOverflow)?;
+
+            if byte_index >= self.bitmap_len {
+                return Err(PmmError::InvalidBitmapLayout);
+            }
+
+            let bit_mask = 1u8 << (frame_index % 8);
+            let value = unsafe {
+                self.bitmap.add(byte_index).read()
+            };
+
+            if value & bit_mask == 0 {
+                return Err(PmmError::FrameAlreadyFree);
+            }
+
+            offset += 1;
+        }
+
+        // Only fully allocated ranges may increase the free-frame count.
+        let new_free_frames = self.free_frames
+            .checked_add(frame_count)
+            .ok_or(PmmError::ArithmeticOverflow)?;
+
+        if new_free_frames > self.total_frames {
+            return Err(PmmError::BitmapValidationFailed);
+        }
+
+        // Release the complete range.
+        offset = 0;
+        while offset < frame_count {
+            let frame_index = first_frame + offset;
+            let byte_index = (frame_index / 8) as usize;
+            let bit_mask = 1u8 << (frame_index % 8);
+
+            let value = unsafe {
+                self.bitmap.add(byte_index).read()
+            };
+
+            unsafe {
+                self.bitmap.add(byte_index)
+                    .write(value & !bit_mask);
+            }
+
+            offset += 1;
+        }
+
+        self.free_frames = new_free_frames;
+
+        Ok(())
+    }
+
+    pub fn next_fit_cursor(&self) -> u64 {
     self.next_fit_frame
 }
 
@@ -906,3 +1293,179 @@ pub fn validate_next_fit_wraparound() -> bool {
         && bitmap[0] == 0xFF
         && bitmap[1] == 0xFF
 }
+
+pub fn validate_contiguous_allocation() -> bool {
+    // Two physically discontiguous regions with adjacent bitmap indices.
+    let mut bitmap = [0u8; 1];
+    let mut regions = [UsableRegion::EMPTY; MAX_USABLE_REGIONS];
+
+    regions[0] = UsableRegion {
+        physical_start: 0x0010_0000,
+        frame_count: 4,
+        first_frame_index: 0,
+    };
+
+    regions[1] = UsableRegion {
+        physical_start: 0x0030_0000,
+        frame_count: 4,
+        first_frame_index: 4,
+    };
+
+    let mut allocator = PmmAllocator {
+        bitmap: bitmap.as_mut_ptr(),
+        bitmap_len: bitmap.len(),
+        next_fit_frame: 0,
+        bitmap_physical_start: 0x0080_0000,
+        bitmap_pages: 1,
+        total_frames: 8,
+        free_frames: 8,
+        regions,
+        region_count: 2,
+        reserved_low_memory_frames: 0,
+    };
+
+    let initial_free = allocator.free_frames();
+
+    let allocation = match allocator.allocate_contiguous(2, 4) {
+        Ok(Some(address)) => address,
+        _ => return false,
+    };
+
+    if allocation != 0x0010_0000
+        || (allocation / limine::PAGE_SIZE) % 4 != 0
+        || allocator.free_frames() != initial_free - 2
+        || bitmap[0] & 0b0000_0011 != 0b0000_0011
+        || allocation.checked_add(limine::PAGE_SIZE) != Some(0x0010_1000)
+    {
+        return false;
+    }
+
+    if allocator.free_contiguous(allocation, 2).is_err()
+        || allocator.free_frames() != initial_free
+        || bitmap[0] & 0b0000_0011 != 0
+    {
+        return false;
+    }
+
+    if !matches!(
+        allocator.free_contiguous(allocation, 2),
+        Err(PmmError::FrameAlreadyFree)
+    ) || allocator.free_frames() != initial_free {
+        return false;
+    }
+
+    if !matches!(
+        allocator.allocate_contiguous(0, 1),
+        Err(PmmError::InvalidFrameAddress)
+    ) || !matches!(
+        allocator.allocate_contiguous(1, 0),
+        Err(PmmError::InvalidFrameAddress)
+    ) || !matches!(
+        allocator.free_contiguous(allocation, 0),
+        Err(PmmError::InvalidFrameAddress)
+    ) {
+        return false;
+    }
+
+    // A partially free range must be rejected without freeing its
+    // still-allocated frames or changing accounting.
+    let partial_run = match allocator.allocate_contiguous(2, 1) {
+        Ok(Some(address)) => address,
+        _ => return false,
+    };
+
+    if allocator.free_frame(partial_run).is_err()
+        || allocator.free_frames() != initial_free - 1
+    {
+        return false;
+    }
+
+    if !matches!(
+        allocator.free_contiguous(partial_run, 2),
+        Err(PmmError::FrameAlreadyFree)
+    ) || allocator.free_frames() != initial_free - 1 {
+        return false;
+    }
+
+    if allocator.free_frame(partial_run + limine::PAGE_SIZE).is_err()
+        || allocator.free_frames() != initial_free
+    {
+        return false;
+    }
+
+    // Adjacent bitmap indices in separate regions are not contiguous RAM.
+    if !matches!(
+        allocator.allocate_contiguous(5, 1),
+        Ok(None)
+    ) || allocator.free_frames() != initial_free {
+        return false;
+    }
+
+    if !matches!(
+        allocator.free_contiguous(0x0010_3000, 2),
+        Err(PmmError::FrameNotUsable)
+    ) || allocator.free_frames() != initial_free {
+        return false;
+    }
+
+    if !matches!(
+        allocator.free_contiguous(0, 1),
+        Err(PmmError::ReservedFrame)
+    ) || !matches!(
+        allocator.free_contiguous(0x0080_0000, 1),
+        Err(PmmError::ReservedFrame)
+    ) {
+        return false;
+    }
+
+    if !matches!(
+        allocator.free_contiguous(allocation + 1, 1),
+        Err(PmmError::InvalidFrameAddress)
+    ) || !matches!(
+        allocator.free_contiguous(u64::MAX - (limine::PAGE_SIZE - 1), 2),
+        Err(PmmError::ArithmeticOverflow)
+    ) {
+        return false;
+    }
+
+    // Verify next-fit wraparound for a multi-frame run.
+    allocator.next_fit_frame = 6;
+
+    let wrapped_run = match allocator.allocate_contiguous(3, 1) {
+        Ok(Some(address)) => address,
+        _ => return false,
+    };
+
+    if wrapped_run != 0x0010_0000
+        || allocator.next_fit_cursor() != 3
+        || allocator.free_frames() != initial_free - 3
+    {
+        return false;
+    }
+
+    if allocator.free_contiguous(wrapped_run, 3).is_err()
+        || allocator.free_frames() != initial_free
+    {
+        return false;
+    }
+
+    let second_region = match allocator.allocate_contiguous(4, 1) {
+        Ok(Some(address)) => address,
+        _ => return false,
+    };
+
+    if second_region != 0x0030_0000
+        || allocator.free_frames() != initial_free - 4
+    {
+        return false;
+    }
+
+    if allocator.free_contiguous(second_region, 4).is_err()
+        || allocator.free_frames() != initial_free
+    {
+        return false;
+    }
+
+    true
+}
+

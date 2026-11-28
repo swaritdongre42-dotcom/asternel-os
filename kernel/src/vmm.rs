@@ -1,5 +1,3 @@
-use core::ops::Range;
-
 pub const PAGE_SIZE: u64 = 4096;
 pub const PAGE_TABLE_ENTRIES: usize = 512;
 pub const VIRTUAL_ADDRESS_BITS: u8 = 48;
@@ -27,6 +25,9 @@ pub enum VmmError {
     PhysicalAddressOutOfRange,
     InvalidPageTableIndex,
     InvalidPageSizeEncoding,
+    UnmappedVirtualAddress,
+    PageTableNotAccessible,
+    InvalidPageTableAddress,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +268,246 @@ impl PageTableEntry {
 
         Ok(Some(PhysicalAddress(base)))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranslationPermissions {
+    pub writable: bool,
+    pub user_accessible: bool,
+    pub executable: bool,
+    pub global: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtualTranslation {
+    pub physical_address: PhysicalAddress,
+    pub page_size: PageSize,
+    pub permissions: TranslationPermissions,
+}
+
+fn finish_translation(
+    entry: PageTableEntry,
+    page_size: PageSize,
+    virtual_address: VirtualAddress,
+    address_width: u8,
+    writable: bool,
+    user_accessible: bool,
+    no_execute: bool,
+) -> Result<VirtualTranslation, VmmError> {
+    let base = entry
+        .physical_base(page_size, address_width)?
+        .ok_or(VmmError::UnmappedVirtualAddress)?
+        .raw();
+    let offset = virtual_address.raw() & page_size.alignment_mask();
+    let physical = base
+        .checked_add(offset)
+        .ok_or(VmmError::PhysicalAddressOutOfRange)?;
+    let physical_address = PhysicalAddress::new(physical, address_width)?;
+
+    Ok(VirtualTranslation {
+        physical_address,
+        page_size,
+        permissions: TranslationPermissions {
+            writable,
+            user_accessible,
+            executable: !no_execute,
+            global: entry.flags().global(),
+        },
+    })
+}
+
+/// Read-only walk of a four-level x86-64 page-table hierarchy.
+/// The callback returns None when a complete table page cannot be read.
+pub fn translate_virtual_address<F>(
+    root_physical: u64,
+    virtual_address: u64,
+    address_width: u8,
+    mut read_entry: F,
+) -> Result<VirtualTranslation, VmmError>
+where
+    F: FnMut(u64, usize) -> Option<u64>,
+{
+    let root = PhysicalAddress::new(root_physical, address_width)?;
+    if !root.page_aligned() || root.raw() == 0 {
+        return Err(VmmError::InvalidPageTableAddress);
+    }
+
+    let virtual_address = VirtualAddress::new(virtual_address)?;
+    let indices = virtual_address.indices();
+    let mut table_physical = root.raw();
+    let mut writable = true;
+    let mut user_accessible = true;
+    let mut no_execute = false;
+
+    let pml4e = PageTableEntry::from_raw(
+        read_entry(table_physical, indices.pml4 as usize)
+            .ok_or(VmmError::PageTableNotAccessible)?,
+    );
+    if !pml4e.is_present() {
+        return Err(VmmError::UnmappedVirtualAddress);
+    }
+    if pml4e.flags().bit_7_set() {
+        return Err(VmmError::InvalidPageSizeEncoding);
+    }
+    writable &= pml4e.flags().writable();
+    user_accessible &= pml4e.flags().user_accessible();
+    no_execute |= pml4e.flags().no_execute();
+    table_physical = pml4e
+        .physical_base(PageSize::Size4KiB, address_width)?
+        .ok_or(VmmError::UnmappedVirtualAddress)?
+        .raw();
+
+    let pdpte = PageTableEntry::from_raw(
+        read_entry(table_physical, indices.pdpt as usize)
+            .ok_or(VmmError::PageTableNotAccessible)?,
+    );
+    if !pdpte.is_present() {
+        return Err(VmmError::UnmappedVirtualAddress);
+    }
+    writable &= pdpte.flags().writable();
+    user_accessible &= pdpte.flags().user_accessible();
+    no_execute |= pdpte.flags().no_execute();
+
+    if pdpte.flags().bit_7_set() {
+        return finish_translation(
+            pdpte, PageSize::Size1GiB, virtual_address, address_width,
+            writable, user_accessible, no_execute,
+        );
+    }
+    table_physical = pdpte
+        .physical_base(PageSize::Size4KiB, address_width)?
+        .ok_or(VmmError::UnmappedVirtualAddress)?
+        .raw();
+
+    let pde = PageTableEntry::from_raw(
+        read_entry(table_physical, indices.pd as usize)
+            .ok_or(VmmError::PageTableNotAccessible)?,
+    );
+    if !pde.is_present() {
+        return Err(VmmError::UnmappedVirtualAddress);
+    }
+    writable &= pde.flags().writable();
+    user_accessible &= pde.flags().user_accessible();
+    no_execute |= pde.flags().no_execute();
+
+    if pde.flags().bit_7_set() {
+        return finish_translation(
+            pde, PageSize::Size2MiB, virtual_address, address_width,
+            writable, user_accessible, no_execute,
+        );
+    }
+    table_physical = pde
+        .physical_base(PageSize::Size4KiB, address_width)?
+        .ok_or(VmmError::UnmappedVirtualAddress)?
+        .raw();
+
+    // For a 4 KiB PTE, bit 7 is PAT rather than PS.
+    let pte = PageTableEntry::from_raw(
+        read_entry(table_physical, indices.pt as usize)
+            .ok_or(VmmError::PageTableNotAccessible)?,
+    );
+    if !pte.is_present() {
+        return Err(VmmError::UnmappedVirtualAddress);
+    }
+    writable &= pte.flags().writable();
+    user_accessible &= pte.flags().user_accessible();
+    no_execute |= pte.flags().no_execute();
+
+    finish_translation(
+        pte, PageSize::Size4KiB, virtual_address, address_width,
+        writable, user_accessible, no_execute,
+    )
+}
+
+/// Synthetic checks for all supported leaf sizes, permission propagation,
+/// and a non-present mapping. These tests never touch active page tables.
+pub fn validate_translation_walk() -> bool {
+    let virtual_raw = 0x0000_1234_5678_9678u64;
+    let virtual_address = match VirtualAddress::new(virtual_raw) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let ix = virtual_address.indices();
+    let flags = FLAG_PRESENT | FLAG_WRITABLE | FLAG_USER;
+
+    let result_4k = translate_virtual_address(0x1000, virtual_raw, 40, |table, index| {
+        if table == 0x1000 && index == ix.pml4 as usize {
+            Some(0x2000 | flags)
+        } else if table == 0x2000 && index == ix.pdpt as usize {
+            Some(0x3000 | flags)
+        } else if table == 0x3000 && index == ix.pd as usize {
+            Some(0x4000 | flags)
+        } else if table == 0x4000 && index == ix.pt as usize {
+            Some(0x0056_7000 | flags | FLAG_GLOBAL)
+        } else {
+            None
+        }
+    });
+    match result_4k {
+        Ok(r) if r.physical_address.raw() == 0x0056_7678
+            && r.page_size == PageSize::Size4KiB
+            && r.permissions.writable && r.permissions.user_accessible
+            && r.permissions.executable && r.permissions.global => {}
+        _ => return false,
+    }
+
+    let result_2m = translate_virtual_address(0x1000, virtual_raw, 40, |table, index| {
+        if table == 0x1000 && index == ix.pml4 as usize {
+            Some(0x2000 | flags)
+        } else if table == 0x2000 && index == ix.pdpt as usize {
+            Some(0x3000 | flags)
+        } else if table == 0x3000 && index == ix.pd as usize {
+            Some(0x0200_0000 | flags | FLAG_BIT_7)
+        } else {
+            None
+        }
+    });
+    match result_2m {
+        Ok(r) if r.physical_address.raw()
+            == 0x0200_0000 + (virtual_raw & 0x1F_FFFF)
+            && r.page_size == PageSize::Size2MiB => {}
+        _ => return false,
+    }
+
+    let result_1g = translate_virtual_address(0x1000, virtual_raw, 40, |table, index| {
+        if table == 0x1000 && index == ix.pml4 as usize {
+            Some(0x2000 | flags)
+        } else if table == 0x2000 && index == ix.pdpt as usize {
+            Some(0x4000_0000 | flags | FLAG_BIT_7)
+        } else {
+            None
+        }
+    });
+    match result_1g {
+        Ok(r) if r.physical_address.raw()
+            == 0x4000_0000 + (virtual_raw & 0x3FFF_FFFF)
+            && r.page_size == PageSize::Size1GiB => {}
+        _ => return false,
+    }
+
+    let restricted = translate_virtual_address(0x1000, virtual_raw, 40, |table, index| {
+        if table == 0x1000 && index == ix.pml4 as usize {
+            Some(0x2000 | FLAG_PRESENT | FLAG_WRITABLE)
+        } else if table == 0x2000 && index == ix.pdpt as usize {
+            Some(0x3000 | FLAG_PRESENT | FLAG_NO_EXECUTE)
+        } else if table == 0x3000 && index == ix.pd as usize {
+            Some(0x4000 | flags)
+        } else if table == 0x4000 && index == ix.pt as usize {
+            Some(0x0056_7000 | flags)
+        } else {
+            None
+        }
+    });
+    match restricted {
+        Ok(r) if !r.permissions.writable && !r.permissions.user_accessible
+            && !r.permissions.executable => {}
+        _ => return false,
+    }
+
+    matches!(
+        translate_virtual_address(0x1000, virtual_raw, 40, |_, _| Some(0)),
+        Err(VmmError::UnmappedVirtualAddress)
+    )
 }
 
 #[repr(C, align(4096))]

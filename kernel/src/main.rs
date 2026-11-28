@@ -1123,6 +1123,26 @@ fn inspect_mtrr_variable_ranges() -> bool {
 
 
 
+
+fn read_active_page_table_entry(
+    table_physical: u64,
+    index: usize,
+) -> Option<u64> {
+    if index >= vmm::PAGE_TABLE_ENTRIES {
+        return None;
+    }
+
+    let table_virtual = limine::physical_range_to_virtual(
+        table_physical,
+        limine::PAGE_SIZE,
+    )?;
+    let entries = table_virtual.cast::<u64>();
+
+    Some(unsafe {
+        core::ptr::read_volatile(entries.add(index))
+    })
+}
+
 // Kernel entry point
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -1139,6 +1159,15 @@ pub extern "C" fn _start() -> ! {
         }
     }
     serial_write("[VMM] Foundation validation PASSED.\r\n");
+
+    serial_write("[VMM] Validating virtual translation walker...\r\n");
+    if !vmm::validate_translation_walk() {
+        serial_write("[VMM] Translation walker validation FAILED.\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    serial_write("[VMM] Translation walker validation PASSED.\r\n");
 
 
         if !inspect_ia32_pat() {
@@ -2101,6 +2130,52 @@ serial_write("[PMM] Next-fit cursor advancement PASSED.\r\n");
     }
 
     serial_write("[MM] CR3 validation PASSED.\r\n");
+
+    // Stage 5.2: Read-only translations using the active CR3 root.
+    serial_write("[VMM] Testing active page-table translation...\r\n");
+
+    let test_physical = 0x0010_0123u64;
+    let test_virtual = match limine::physical_to_virtual(test_physical) {
+        Some(address) => address as u64,
+        None => {
+            serial_write("[VMM] ERROR: HHDM test address unavailable.\r\n");
+            loop { core::hint::spin_loop(); }
+        }
+    };
+
+    let hhdm_translation = match vmm::translate_virtual_address(
+        root_page, test_virtual, address_width, read_active_page_table_entry,
+    ) {
+        Ok(result) => result,
+        Err(_) => {
+            serial_write("[VMM] ERROR: HHDM translation failed.\r\n");
+            loop { core::hint::spin_loop(); }
+        }
+    };
+    if hhdm_translation.physical_address.raw() != test_physical {
+        serial_write("[VMM] ERROR: HHDM physical translation mismatch.\r\n");
+        loop { core::hint::spin_loop(); }
+    }
+    serial_write("[VMM] HHDM virtual-to-physical translation PASSED.\r\n");
+
+   let kernel_code_virtual = serial_write as *const () as usize as u64;
+    let kernel_translation = match vmm::translate_virtual_address(
+        root_page, kernel_code_virtual, address_width, read_active_page_table_entry,
+    ) {
+        Ok(result) => result,
+        Err(_) => {
+            serial_write("[VMM] ERROR: Kernel code translation failed.\r\n");
+            loop { core::hint::spin_loop(); }
+        }
+    };
+    if !kernel_translation.permissions.executable {
+        serial_write("[VMM] ERROR: Kernel code mapping is not executable.\r\n");
+        loop { core::hint::spin_loop(); }
+    }
+    serial_write("[VMM] Kernel code executable mapping PASSED.\r\n");
+    serial_write("[VMM] Active virtual translation PASSED.\r\n");
+
+
 
 
     // Read-only PML4 inspection
